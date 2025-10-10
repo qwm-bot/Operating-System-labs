@@ -250,6 +250,10 @@ PMP1: 0x0000000000000000-0xffffffffffffffff (A,R,W,X)
 
 为了确保内核被正确加载并运行，我们必须精确地控制其**内存布局**。这正是通过**链接脚本** `tools/kernel.ld` 实现的。它首先通过 `BASE_ADDRESS = 0x80200000;` 强制规定了内核的起始加载地址，与 OpenSBI 的约定保持一致。随后，`ENTRY(kern_entry)` 指定了 `kern_entry` 作为整个程序的入口点。在 `SECTIONS` 部分，它将所有输入目标文件中的代码片段（`.text.*`）聚合到输出文件的 `.text` 段，将只读数据聚合到 `.rodata` 段，已初始化数据聚合到 `.data` 段。特别地，对于未初始化或初始化为零的全局变量，它们被放入 `.bss` 段。正如趣闻中所说，`.bss` 的设计是为了“更好地节省空间”，因为它在可执行文件中只记录长度而不占用实际空间。链接脚本还定义了 `edata` 和 `end` 等符号，分别指向 `.data` 段的结束和 `.bss` 段的结束。这使得我们的内核可以在 `kern_init` 函数中，通过 `memset(edata, 0, end - edata);` 这行代码，精确地完成对 `.bss` 段的清零，这是 C 语言运行环境得以正确建立的关键一步。
 
+常见的内存布局如下所示：
+<img width="685" height="913" alt="image" src="https://github.com/user-attachments/assets/3ee673d8-eab2-436a-b3ed-4179b1f9d25b" />
+
+
 在内核的**执行环境初始化**阶段，`kern/init/entry.S` 文件扮演了至关重要的角色。C 语言的运行严重依赖于一个合法的栈空间来进行函数调用、参数传递和局部变量存储。而内核启动之初，栈指针 `sp` 寄存器的值是未定义的。因此，在跳转到任何 C 函数之前，必须先通过汇编指令 `la sp, bootstacktop` 将 `sp` 指向我们预先在 `.data` 段分配好的内核栈的顶部 (`bootstacktop`)。只有在完成了这个最基础的运行环境设置后，才能安全地通过 `tail kern_init` 跳转到 C 代码入口，避免了不可预测的崩溃。
 
 最后，本实验最精髓的部分莫过于**从零构建了一个微型的分层I/O系统**的过程。由于不能依赖任何外部标准库，我们从最底层的 `ecall` 调用 OpenSBI 服务开始。`libs/sbi.c` 将这次 `ecall` 封装成 C 函数 `sbi_console_putchar`，这是第一层抽象，隐藏了汇编和寄存器操作的细节。接着，`kern/driver/console.c` 中的 `cons_putc` 提供了设备无关的控制台输出接口，这是第二层抽象，未来即便底层硬件变化，上层代码也无需修改。最终，在 `libs/printfmt.c` 中，`vprintfmt` 函数实现了复杂的格式字符串解析逻辑，它以一个函数指针 `putch` 作为输出后端，而 `kern/libs/stdio.c` 中的 `cprintf` 则将 `cons_putc` 作为 `putch` 的具体实现传递给 `vprintfmt`。这个过程完美诠释了操作系统中**分层抽象**的设计思想，也揭示了应用层库函数（如 `printf`）与底层系统服务（如 `ecall`）之间层层递进的依赖关系。
