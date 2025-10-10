@@ -227,7 +227,34 @@ PMP1: 0x0000000000000000-0xffffffffffffffff (A,R,W,X)
 (THU.CST) os is loading ...
 ```
 最后，kern_init()调用cprintf()输出一行信息，表示内核启动成功。
-
+5. watch指令
+```bash
+(gdb) watch *0x80200000
+Hardware watchpoint 1: *0x80200000
+(gdb) break kern_entry
+Note: breakpoint 1 also set at pc 0x80200000.
+Breakpoint 2 at 0x80200000: file kern/init/entry.S, line 7.
+(gdb) c
+Continuing...
+Breakpoint 2, kern_entry () at kern/init/entry.S:7
+7       la sp, bootstacktop
+(gdb) si
+0x0000000080200004 in kern_entry () at kern/init/entry.S:7
+7           la sp, bootstacktop 
+```
+在此处，我们对在本实验过程中的watch指令进行简单说明：可以看到，我们企图使用watch *0x80200000观察内核加载瞬间，避免单步跟踪大量代码，但是程序执行到`kern_entry`，我们仍看不到该内存处的数据的变化。原因是：在我们的实验总，操作系统的加载实际上是由QEMU来完成，在 Qemu 开始执行任何指令之前，首先两个文件将被加载到 Qemu 的物理内存中：即作为 bootloader 的 OpenSBI.bin 被加载到物理内存以物理地址 0x80000000 开头的区域上，同时内核镜像 os.bin 被加载到以物理地址 0x80200000 开头的区域上。所以实际上在`make gdb`的开始,0x80200000处已经加载好了kern_entry的机器码，所以后续此处的数据将不再发生变化。
+```bash
+Reading symbols from bin/kernel... 
+The target architecture is set to "riscv:rv64". 
+Remote debugging using localhost:1234 
+0x0000000000001000 in ?? () 
+(gdb) x/16xb 0x80200000 
+0x80200000 <kern_entry>: 0x17 0x31 0x00 0x0 
+0 0x13 0x01 0x01 0x00 
+0x80200008 <kern_entry+8>: 0x09 0xa0 0x17 0x3 
+5 0x00 0x00 0x13 0x05 
+(gdb)
+```
 ---
 #### 练习答案
 1. RISC-V 硬件加电后最初执行的几条指令位于什么地址？
