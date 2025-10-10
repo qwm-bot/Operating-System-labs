@@ -97,7 +97,7 @@ t0             0x80000000       2147483648
 由于RISC-V是小端序，所以当执行`ld t0,24(t0)`时，从0x1018开始取8个字节，所以t0=0x80000000;
 >第一阶段将必要的文件载入到 Qemu 物理内存之后，Qemu CPU 的程序计数器PC会被初始化为 0x1000 ，因此 Qemu 实际执行的第一条指令位于物理地址 0x1000，接下来它将执行寥寥数条指令并跳转到物理地址 0x80000000 对应的指令处(OpenBIS)并进入第二阶段。
 
-**第二阶段: Bootloader**
+**第二阶段: OpenSBI 初始化与内核加载**
 
  进入到0x80000000地址后，我们可以通过`x/<format> <address>`查看OpenSBI.bin的汇编代码，通过执行这些指令，初始化处理器的运行环境。由于汇编代码过长，我们以部分代码为例进行分析：
 ```asm
@@ -227,7 +227,10 @@ PMP1: 0x0000000000000000-0xffffffffffffffff (A,R,W,X)
 (THU.CST) os is loading ...
 ```
 最后，kern_init()调用cprintf()输出一行信息，表示内核启动成功。
+
 5. watch指令
+
+在此处，我们对在本实验过程中的watch指令进行简单说明
 ```bash
 (gdb) watch *0x80200000
 Hardware watchpoint 1: *0x80200000
@@ -242,7 +245,7 @@ Breakpoint 2, kern_entry () at kern/init/entry.S:7
 0x0000000080200004 in kern_entry () at kern/init/entry.S:7
 7           la sp, bootstacktop 
 ```
-在此处，我们对在本实验过程中的watch指令进行简单说明：可以看到，我们企图使用watch *0x80200000观察内核加载瞬间，避免单步跟踪大量代码，但是程序执行到`kern_entry`，我们仍看不到该内存处的数据的变化。原因是：在我们的实验总，操作系统的加载实际上是由QEMU来完成，在 Qemu 开始执行任何指令之前，首先两个文件将被加载到 Qemu 的物理内存中：即作为 bootloader 的 OpenSBI.bin 被加载到物理内存以物理地址 0x80000000 开头的区域上，同时内核镜像 os.bin 被加载到以物理地址 0x80200000 开头的区域上。所以实际上在`make gdb`的开始,0x80200000处已经加载好了kern_entry的机器码，所以后续此处的数据将不再发生变化。
+可以看到，我们企图使用watch *0x80200000观察内核加载瞬间，避免单步跟踪大量代码，但是程序执行到`kern_entry`，我们仍看不到该内存处的数据的变化。原因是：在我们的实验总，操作系统的加载实际上是由QEMU来完成，在 Qemu 开始执行任何指令之前，首先两个文件将被加载到 Qemu 的物理内存中：即作为 bootloader 的 OpenSBI.bin 被加载到物理内存以物理地址 0x80000000 开头的区域上，同时内核镜像 os.bin 被加载到以物理地址 0x80200000 开头的区域上。所以实际上在`make gdb`的开始,0x80200000处已经加载好了kern_entry的机器码，所以后续此处的数据将不再发生变化。
 ```bash
 Reading symbols from bin/kernel... 
 The target architecture is set to "riscv:rv64". 
@@ -258,7 +261,7 @@ Remote debugging using localhost:1234
 ---
 #### 练习答案
 1. RISC-V 硬件加电后最初执行的几条指令位于什么地址？
-- RISC-V硬件加电后最初执行的几条指令从0x1000地址开始，直到在0x1014处进行跳转结束。
+- RISC-V硬件加电后最初执行的几条指令从0x1000地址开始，直到在0x1010处进行跳转结束。
 - 跳转到0x80000000后，OpenSBI进行相关工作，工作完成后跳转到0X80200000执行内核代码。
 2. 它们主要完成了哪些功能？
 
