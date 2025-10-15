@@ -1,5 +1,171 @@
 # lab2：物理内存和页表
-## 练习1
+## 练习1：理解first-fit 连续物理内存分配算法（思考题）
+first-fit连续物理内存分配算法：分配时从空闲块链表中找到第一个足够大的空闲块进行分配；释放时将释放的块重新加入空闲链表，并合并相邻空闲块。
+### 函数实现分析
+#### (1)default_init()
+```c
+static void
+default_init(void) {
+    list_init(&free_list);// 初始化双向链表
+    nr_free = 0;// 空闲页计数器清零
+}
+```
+该函数首先调用list_init函数来初始化一个空的双向链表free_list，然后定义了nr_free空闲块的个数定义为0。用于初始化存放空闲块的链表。
+#### (2) default_init_memmap()
+```c
+static void
+default_init_memmap(struct Page *base, size_t n) {
+    assert(n > 0);//判定n大于0，如果为0不需要存放页面
+    struct Page *p = base;
+    for (; p != base + n; p ++) {
+        assert(PageReserved(p));// 确保页面是保留状态
+        p->flags = p->property = 0;// 初始化标志位和属性，之后页面可以被分配
+        set_page_ref(p, 0);// 引用计数清零
+    }
+    base->property = n;// 设置第一页的块大小
+    SetPageProperty(base); // 标记为有效空闲块
+    nr_free += n;// 更新空闲页总数
+    // 将空闲块插入链表（按地址升序）
+    if (list_empty(&free_list)) {
+        list_add(&free_list, &(base->page_link));
+    } else {
+        list_entry_t* le = &free_list;
+        while ((le = list_next(le)) != &free_list) {
+            struct Page* page = le2page(le, page_link);
+            if (base < page) {//如果新页面起始地址小于当前遍历到的页面地址，说明找到正确插入位置
+                list_add_before(le, &(base->page_link));
+                break;
+            } else if (list_next(le) == &free_list) {
+                list_add(le, &(base->page_link));
+            }
+        }
+    }
+}
+```
+该函数初始化一段连续物理内存页，将其标记为空闲块并插入链表。
+base是指向这段连续物理内存的起始页结构体；n需要初始化的连续物理页面的总数。首先判定n是否大于0，如果=0不需要存放页面；再遍历所有页，初始化标志位和引用计数；设置第一页的 property为块大小n，并标记为有效后按地址升序插入空闲链表。如果链表为空直接链入链表；否则遍历链表直到新页面起始地址小于当前遍历到的页面地址，说明找到正确插入位置，在该页面之前插入新的链表节点(list_add_before函数)；如果遍历完链表也没有找到这样的页面，则将新的链表节点添加到链表末尾 (list_add函数)。
+```c
+//libs/list.h
+static inline void
+list_add_before(list_entry_t *listelm, list_entry_t *elm) {
+    __list_add(elm, listelm->prev, listelm);
+}
+static inline void
+list_add(list_entry_t *listelm, list_entry_t *elm) {
+    list_add_after(listelm, elm);
+}
+```
+#### (3)default_alloc_pages()
+```c
+static struct Page *
+default_alloc_pages(size_t n) {
+    assert(n > 0);
+    if (n > nr_free) {
+        return NULL;// 检查是否有足够空闲页
+    }
+    struct Page *page = NULL;
+    list_entry_t *le = &free_list;
+    // 遍历链表，找到第一个大小 >=n 的块
+    while ((le = list_next(le)) != &free_list) {
+        struct Page *p = le2page(le, page_link);
+        if (p->property >= n) {
+            page = p;
+            break;
+        }
+    }
+    if (page != NULL) {//找到大小 >=n 的块
+        list_entry_t* prev = list_prev(&(page->page_link));// 从链表中移除该块
+        list_del(&(page->page_link));
+        if (page->property > n) {
+            // 分割剩余部分
+            struct Page *p = page + n;
+            p->property = page->property - n;
+            SetPageProperty(p);
+            list_add(prev, &(p->page_link));// 将剩余块重新插入链表
+        }
+        nr_free -= n;
+        ClearPageProperty(page);// 清除分配页的有效标志
+    }
+    return page;
+}
+```
+该函数用于分配n个连续的物理页。
+首先检查是否有足够的空闲页（n <= nr_free）；然后遍历空闲链表，找到第一个大小 ≥ n的块；若找到的块大于需求，分割剩余部分并重新插入链表；最后更新空闲页计数，并返回分配的内存首地址。
+#### (4)default_free_pages()
+```c
+static void
+default_free_pages(struct Page *base, size_t n) {
+    assert(n > 0);
+    struct Page *p = base;
+    for (; p != base + n; p ++) {
+        assert(!PageReserved(p) && !PageProperty(p));//被释放的页不能是保留页，不能是已空闲页
+        p->flags = 0;
+        set_page_ref(p, 0);
+    }
+    base->property = n;
+    SetPageProperty(base);
+    nr_free += n;
+    // 按地址升序插入链表
+    if (list_empty(&free_list)) {
+        list_add(&free_list, &(base->page_link));
+    } else {
+        list_entry_t* le = &free_list;
+        while ((le = list_next(le)) != &free_list) {
+            struct Page* page = le2page(le, page_link);
+            if (base < page) {
+                list_add_before(le, &(base->page_link));
+                break;
+            } else if (list_next(le) == &free_list) {
+                list_add(le, &(base->page_link));
+            }
+        }
+    }
+    // 尝试合并低地址相邻块
+    list_entry_t* le = list_prev(&(base->page_link));
+    if (le != &free_list) {
+        p = le2page(le, page_link);
+        if (p + p->property == base) {
+            p->property += base->property;
+            ClearPageProperty(base);
+            list_del(&(base->page_link));
+            base = p;
+        }
+    }
+    // 尝试合并高地址相邻块
+    le = list_next(&(base->page_link));
+    if (le != &free_list) {
+        p = le2page(le, page_link);
+        if (base + base->property == p) {
+            base->property += p->property;
+            ClearPageProperty(p);
+            list_del(&(p->page_link));
+        }
+    }
+}
+```
+该函数用于释放 n个连续的物理页，并尝试合并相邻空闲块。
+首先初始化要释放的页并更新全局空闲页计数；再按地址升序插入空闲链表；检查前后相邻块是否连续，若连续则合并。
+#### (5)其他函数
+- default_nr_free_pages()返回当前系统中空闲物理页的总数，供测试函数验证内存管理的正确性。
+- basic_check()是基础测试函数，首先分配3个页面，验证分配成功且互不相同；临时清空空闲链表，验证此时无法分配新页面；释放之前分配的页面，验证空闲计数正确；重新分配页面，验证能获取到刚释放的页面。
+- default_check()是复杂测试函数，首先分配5个页面，然后释放其中3个页面，验证能否正确分配这3个页面；测试与相邻空闲块的合并功能；验证分配大块连续内存的能力；最终验证所有内存都被正确回收。
+#### (6)结构体default_pmm_manager
+default_pmm_manager是 First-Fit 内存管理器的接口实例，封装算法核心操作。这样内核其他模块只需调用 pmm_manager->alloc_pages()，而无需关心底层是 First-Fit 还是其他算法。
+#### (7)工作流程总结（操作系统物理内存管理）
+系统启动时首先通过 default_init 初始化内存管理器，通过 default_init_memmap 将可用内存加入管理；当需要内存时调用 default_alloc_pages 进行分配；当释放内存时调用 default_free_pages 回收内存并尝试合并；通过 default_check 等函数验证分配器的正确性。
+### 改进空间
+#### 使用更高效的数据结构
+- 当前使用双向链表管理空闲块，查找时间复杂度为 O(n)。
+- 可以使用平衡二叉搜索树或跳表，使查找时间复杂度降至 O(log n)。
+#### 缓存最近分配的块
+- 现在连续分配相似大小的块时，每次都要从头遍历链表。
+- 可以记录上次分配的块地址，下次分配时优先检查其相邻空间。
+#### 合并策略优化
+- 现在仅在释放时合并相邻块，可能遗留小碎片。
+- 可以定期全局合并，在内存碎片达到阈值时，主动扫描并合并所有空闲块。
+#### 块分裂策略调整
+- 当前直接按请求大小分割，可能产生无用的小块。
+- 可以改为仅当剩余块大于某个阈值时才分裂，否则整块分配。
 ## 练习2
 ## 扩展练习Challenge
 ## 扩展练习Challenge
