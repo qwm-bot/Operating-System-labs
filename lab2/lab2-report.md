@@ -351,9 +351,13 @@ cprintf("[Buddy 测试] split/merge 测试开始\n");
 ```
 因此测试分配两个4页块，而阶2没有空闲块，伙伴算法会从阶3分裂一个8页块成4页块。
 这是测试前的阶2、阶3：
+
 <img src="测试前.png" width="60%">
+
 这是分配后的阶2、阶3：
+
 <img src="测试后.png" width="60%">
+
 之后合并4页块，若合并成功，alloc_pages(8)应能从阶3链表中分配到一个8页块。如下输出，8页块起始页索引一样，因此合并成功。
 ```c
 [Buddy 测试] split/merge 测试开始
@@ -363,7 +367,9 @@ cprintf("[Buddy 测试] split/merge 测试开始\n");
 [Buddy 测试] split/merge 测试通过
 ```
 最终测试全部通过。
+
 <img src="测试通过.png" width="60%">
+
 ## 扩展练习Challenge
 ## 扩展练习Challenge：硬件的可用物理内存范围的获取方法（思考题）
 > 如果 OS 无法提前知道当前硬件的可用物理内存范围，请问你有何办法让 OS 获取可用物理内存范围？
