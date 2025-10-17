@@ -252,6 +252,7 @@ list_entry_t *le = list_next(&buddy_areas[j].free_list);
         int cur_k = order_of(remaining);
         struct Page *cur = base + off;
         size_t gidx = page_index(cur);
+   }
 ```
 - 伙伴合并仅当伙伴块存在（buddy != NULL），伙伴块空闲（PageProperty(buddy)）和伙伴块大小匹配（buddy->property == (1 << pk)）。然后就从空闲链表移除伙伴块，选择地址较低的块作为新合并块的基址
 ```c
@@ -370,10 +371,224 @@ cprintf("[Buddy 测试] split/merge 测试开始\n");
 
 <img src="测试通过.png" width="60%">
 
-## 扩展练习Challenge
+## 扩展练习Challenge：任意大小的内存单元slub分配算法（需要编程）
+>slub算法，实现两层架构的高效内存单元分配，第一层是基于页大小的内存分配，第二层是在第一层基础上实现基于任意大小的内存分配。可简化实现，能够体现其主体思想即可。
+- 参考[linux的slub分配算法](linux/mm/slub.c at master · torvalds/linux)，在ucore中实现slub分配算法。要求有比较充分的测试用例说明实现的正确性，需要有设计文档。
+### 设计文档
+#### slub分配算法的主体思想
+Buddy System以页（4KB）为单位进行内存的管理，当我们想要申请的内存比较小时，Buddy System还是会给我们提供至少4KB的内存，这样就造成了内存的浪费。为了补充和解决Buddy System的缺陷，提出了`slub`算法。
+
+slub算法主要实现两层架构的高效内存单元分配，第一层基于页大小的内存分配，调用我们实现的`best_fit`,`defult_fit`,`buddy_system`接口即可；第二层是在第一层基础上实现基于任意大小的内存分配。
+
+SLUB的核心思想是：将物理内存按页（page）为单位划分为多个`slab`，每个`slab`中又被切分成若干个大小相同的` object`（对象），每种大小的对象由一个独立的 `kmem_cache` 管理。
+,
+在SLUB中，每个slab都处于以下三种状态之一：
+- FULL：slab 中的所有对象（object）都已被分配，没有空闲单元；
+- Parital:slab 中部分对象被分配，部分仍空闲;
+- Free: slab 中所有对象都空闲，没有任何被占用的单元。
+
+分配内存的过程：
+
+1. **选择`kmem_cache`**:根据要分配对象的大小，找到对应的`kmem_cache`;
+2. **选择`slab`**:优先使用`partial`的slab,其次是`free`的slab,如果没有，则用`Buddy System`创建一个新的slab(一个slab的大小为4KB)；
+3. **分配`object`**:从slab的freelist中取出一个空闲对象；
+4. **更新`slab`**:如果slab被分配满，标记为full,否则保持partial;
+5. **返回对象地址**：将对象地址返回给调用者。
+
+内存释放的过程：
+
+1. **找到对象所属的 slab**：通过对象地址计算出它属于哪个 slab。
+2. **加入 freelist**：将对象放回 slab 的空闲链表（freelist）。
+3. **更新 slab 状态**：
+
+   * 如果 slab 之前是 full，现在有空闲对象了，状态改为 partial。
+   * 如果 slab 所有对象都被释放，状态改为free，可能被回收给页分配器。
+4. **更新 kmem_cache**：保持 partial slab 链表和 full/free slab 链表的正确管理。 
+#### 主要的数据结构
+1. **`kmem_cache`**
+`kmem_cache`表示一种大小的obj的缓冲池，管理三种状态的slab,每种slab用单向链表连接。
+```c
+struct slab {
+    unsigned int inuse;        // 已分配对象数
+    unsigned int total;        // 对象总数
+    void *freelist;            // 空闲对象链表头
+    uint8_t *bitmap;           // 位图起始地址
+    void *obj_base;            // 对象区起始地址
+    struct slab *next;         // 下一个 slab
+};
+```
+2. **`slab`**
+```c
+struct slab {
+    unsigned int inuse;        // 已分配对象数
+    unsigned int total;        // 对象总数
+    void *freelist;            // 空闲对象链表头
+    uint8_t *bitmap;           // 位图起始地址
+    void *obj_base;            // 对象区起始地址
+    struct slab *next;         // 下一个 slab
+};
+```
+3. **全局缓存表（`kmem_cache`数组）**
+```c
+#define CACHE_NUM (MAX_OBJ_SHIFT - MIN_OBJ_SHIFT + 1)
+static struct kmem_cache caches[CACHE_NUM];
+```
+#### slab页的内存布局
+在真正编写slub代码时，我们会遇到为slab结构体分配内存空间的问题，开始时我们的想法是将slab结构体单独放置到一个page中，其管理的obj放到一个page中，以使一个page中存放尽可能多的obj,但这样会造成跨页访问，slab回收实现起来也比较困难；经过对现代Linux操作系统slab存储方式的调研，发现其一般将slab结构体和obj放到一页上，将所有的信息集中，便于管理，也解决了上面遇到的问题，于是我们也采取了这样的方式。为了快速判断obj和slab的状态,我们也添加了`bitmap`,用来标识obj是否被占用。
+
+目前我们每一个slab页的结构如下所示：
+```diff
++----------------------------+
+| struct slab                |  ← 管理元数据（inuse, freelist, ...）
++----------------------------+
+| bitmap[]                   |  ← 每个对象对应 1 bit
++----------------------------+
+|  对象区(obj_base)          |
+|   [Obj0][Obj1][Obj2]...    |  ← 实际分配给用户的对象
++----------------------------+
+| 空余空间（对齐填充）         |
++----------------------------+
+```
+好的，我帮你重新整理一下 Markdown，逻辑顺序更清晰，重点突出每个函数的作用、内部逻辑和关键代码，去掉冗余，让文档更易读：
+
+---
+
+#### 主要函数设计
+
+---
+
+### 1. `slab_create(struct kmem_cache *cache)`
+
+**作用**：
+创建一个新的 slab，占一页内存，在页内初始化 slab 元数据、bitmap 和对象链表。
+
+**内部逻辑**：
+
+1. 分配一页物理内存并转换为虚拟地址，作为 slab 起始。
+2. 初始化 slab 元数据：
+
+   * `inuse = 0`，`next = NULL`
+   * bitmap 紧跟在 slab 元数据后，全部清 0
+   * 计算可存放对象数 `obj_num` 和 bitmap 大小：
+
+     ```c
+     int obj_num = (SLAB_PAGE_SIZE - sizeof(struct slab) - bitmap_bytes) / obj_size;
+     ```
+3. 对象区起始地址 `obj_base = bitmap + bitmap_bytes`，构建 freelist 链表。
+
+---
+
+### 2. `slub_init(void)`
+
+**作用**：
+初始化 SLUB 系统，为每个对象大小创建 kmem_cache 并初始化 slab 链表。
+
+**内部逻辑**：
+
+* 遍历 `caches` 数组，设置每个缓存的对象大小，并将 `slabs_free`、`slabs_partial`、`slabs_full` 链表置为空。
+
+---
+
+### 3. `slub_alloc(size_t size)`
+
+**作用**：
+为指定大小的对象分配内存，更新 slab 的 freelist 和 bitmap，并维护 slab 状态链表。
+
+**内部逻辑**：
+
+1. 获取对应 kmem_cache。
+2. 从 `slabs_partial` 链表分配对象；若无可用 slab，则从 `slabs_free` 获取或新建 slab：
+
+   ```c
+   struct slab *sl = cache->slabs_partial;
+   if (!sl) {
+       if (!cache->slabs_free) {
+           struct slab *newsl = slab_create(cache);
+           newsl->next = cache->slabs_free;
+           cache->slabs_free = newsl;
+       }
+       sl = cache->slabs_free;
+       cache->slabs_free = sl->next;
+       sl->next = cache->slabs_partial;
+       cache->slabs_partial = sl;
+   }
+   ```
+3. 从 slab 的 freelist 取对象，并更新 bitmap：
+
+   ```c
+   sl->freelist = *(void **)obj;
+   sl->inuse++;
+   sl->bitmap[idx_bit / 8] |= (1 << (idx_bit % 8));
+   ```
+4. slab 满时，将其从 `slabs_partial` 移到 `slabs_full` 链表。
+
+---
+
+### 4. `slub_free(void *objp, size_t size)`
+
+**作用**：
+回收对象，将其插入 slab freelist，清除 bitmap，并根据 slab 使用状态更新链表或释放整页内存。
+
+**内部逻辑**：
+
+1. 通过对象地址计算 slab 起始页：
+
+   ```c
+   struct slab *sl = (struct slab *)((uintptr_t)objp & ~(SLAB_PAGE_SIZE - 1));
+   ```
+2. 将对象插回 freelist，并清除 bitmap 位：
+
+   ```c
+   *(void **)objp = sl->freelist;
+   sl->freelist = objp;
+   sl->inuse--;
+   sl->bitmap[idx_bit / 8] &= ~(1 << (idx_bit % 8));
+   ```
+3. slab 状态管理：
+
+   * 若 slab 从 full 变为 partial，将其移动到 `slabs_partial` 链表
+   * 若 slab 全空，将其从 `slabs_partial` 移除，并释放整页内存
+
+---
+#### 正确性测试
+- 测试对象
+   - 对象大小：8B ~ 2048B（2^3 ~ 2^11），对应系统 SLUB 支持的缓存大小。
+
+   - 每种大小分配固定数量的对象，保证多页 slab 的场景。
+
+   - 使用二维数组 objs[size_index][obj_index] 管理不同大小的对象，方便阶段性释放和复用测试。
+
+- 测试场景
+
+   我们模拟了6种在实际应用中的场景，对应代码中的六个阶段：
+
+   | 阶段 | 功能       | 关键逻辑                                       |
+   | -- | -------- | ------------------------------------------ |
+   | 1  | 分配不同大小对象 | 为每种大小分配 TEST_OBJ_NUM / num_sizes 对象，写入特定数据 |
+   | 2  | 部分释放     | 每种大小释放一半对象，检查 slab 是否从 full 变为 partial     |
+   | 3  | 对象复用     | 再次分配部分对象，验证空闲 slab 是否复用                    |
+   | 4  | 全部释放     | 释放所有对象，验证 slab 全空是否释放整页                    |
+   | 5  | 超大对象分配   | 尝试分配超过最大对象大小，期望返回 NULL                     |
+   | 6  | NULL 释放  | 调用 slub_free(NULL, size)，验证安全性             |
+
+- 测试要点
+   - 使用 cprintf 打印阶段信息，便于观察运行结果。
+   - 通过 memset 写入不同的模式数据，检测对象有效性。
+   - 每个阶段结束后打印阶段完成信息，方便阶段划分。
+   - 二维数组管理不同大小对象，方便在阶段2和阶段4进行批量释放。
+- 测试代码的运行方法
+
+我们的测试代码为`/kern/mm/slub_test.c`文件，运行测试代码时，在`init.c`文件中导入外部函数
+```c
+extern void slub_test(void);
+```
+然后在`while(1);`前添加一行`slub_test();`,运行`make qemu`时便可看到测试函数打印出来的信息。
 ## 扩展练习Challenge：硬件的可用物理内存范围的获取方法（思考题）
 > 如果 OS 无法提前知道当前硬件的可用物理内存范围，请问你有何办法让 OS 获取可用物理内存范围？
 - **手工探测物理内存** 我们可以借鉴一下在没有SPD时，CPU探测内存条的相关信息的办法。向一块连续的区域上写入0x55，然后读取这一片区域的数据判断是否与写入的数据一致，然后再向这一片区域内写入0xAA,然后同样读取这片区域的数据判断是否和写入的一致，如果两次数据都一致，说明这块区域中的0和1是可以被程序员操纵的，大概率是一块内存。操作系统经过大范围这样的扫描，可以得到可用物理内存范围（但不一定百分百准确）。
+- **DMA探测物理内存** DMA为直接内存访问。操作系统可以为`DMA`设备分配一个缓冲区（可以用OS内核本身已占用的安全页面）来传输数据。向`DMA`设备发送命令，让它读取某个物理地址范围的数据到缓冲区。如果 `DMA`访问成功并返回正确数据，则说明该物理地址存在可用内存。如果`DMA`访问失败，则说明该区域不可用。通过这种方式可以 扫描整个地址空间，得到一个大概的可用物理内存范围。
+
+（但如果应用到实际，两种方法都存在安全风险：可能破坏原有内存数据或硬件寄存器，导致系统崩溃或设备异常。）
 ## 实验中重要知识点
 1. > 操作系统是怎样知道当前硬件的可用内存物理范围的？
 
