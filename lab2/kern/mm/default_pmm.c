@@ -189,7 +189,7 @@ basic_check(void) {
     assert(p0 != p1 && p0 != p2 && p1 != p2);
     assert(page_ref(p0) == 0 && page_ref(p1) == 0 && page_ref(p2) == 0);
 
-    assert(page2pa(p0) < npage * PGSIZE);
+    assert(page2pa(p0) < npage * PGSIZE);//检查确保转换的物理地址再合法范围内
     assert(page2pa(p1) < npage * PGSIZE);
     assert(page2pa(p2) < npage * PGSIZE);
 

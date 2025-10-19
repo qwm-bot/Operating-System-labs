@@ -186,15 +186,15 @@ static void buddy_check(void) {
 
     cprintf("[Buddy 测试] 初始可用页数: %lu\n", initial_free);
 
-for (int i = 0; i < MAX_ORDER; i++) {
-            cprintf("[Buddy] 阶 %d (块大小 %lu 页) — nr_free(页数) = %lu\n", i, 1UL << i, buddy_areas[i].nr_free);
-            list_entry_t *le = &buddy_areas[i].free_list;
-            int idx = 0;
-            while ((le = list_next(le)) != &buddy_areas[i].free_list) {
-                struct Page *p = le2page(le, page_link);
-                cprintf(" 块 %d: 页索引=%lu, 物理地址=0x%016lx, property=%u\n", idx++, page_index(p), page2pa(p), p->property);
-            }
-}
+    for (int i = 0; i < MAX_ORDER; i++) {
+        cprintf("[Buddy] 阶 %d (块大小 %lu 页) — nr_free(页数) = %lu\n", i, 1UL << i, buddy_areas[i].nr_free);
+        list_entry_t *le = &buddy_areas[i].free_list;
+        int idx = 0;
+        while ((le = list_next(le)) != &buddy_areas[i].free_list) {
+            struct Page *p = le2page(le, page_link);
+            cprintf(" 块 %d: 页索引=%lu, 物理地址=0x%016lx, property=%u\n", idx++, page_index(p), page2pa(p), p->property);
+        }
+    }
 
     /* 单页分配/释放测试 */
     cprintf("[Buddy 测试] 单页分配/释放测试开始\n");
@@ -243,7 +243,7 @@ for (int i = 0; i < MAX_ORDER; i++) {
                 struct Page *p = le2page(le, page_link);
                 cprintf(" 块 %d: 页索引=%lu, 物理地址=0x%016lx, property=%u\n", idx++, page_index(p), page2pa(p), p->property);
             }
-}
+        }
         free_pages(a, 4);
         free_pages(b, 4);
         struct Page *p8b = alloc_pages(8);

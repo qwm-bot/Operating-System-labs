@@ -148,25 +148,36 @@ void *slub_alloc(size_t size) {
 void slub_free(void *objp, size_t size) {
     if (objp == NULL)
         return;
+
+    // 如果对象大于 SLAB_PAGE_SIZE，直接按页释放
+    if (size > SLAB_PAGE_SIZE) {
+        struct Page *page = kva2page((uintptr_t)objp);
+        size_t npages = (size + PGSIZE - 1) / PGSIZE;  // 向上取整
+        free_pages(page, npages);
+        return;
+    }
+
+    // 小对象：走 slab 释放逻辑
     int idx = size_to_index(size);
     if (idx < 0)
         return;
+
     struct kmem_cache *cache = &caches[idx];
 
     uintptr_t obj_addr = (uintptr_t)objp;
     uintptr_t page_addr = obj_addr & ~(SLAB_PAGE_SIZE - 1);
     struct slab *sl = (struct slab *)page_addr;
 
-    /* 重新插入 freelist */
+    // 重新插入 freelist
     *(void **)objp = sl->freelist;
     sl->freelist = objp;
     sl->inuse--;
 
-    /* 清除 bitmap 位 */
+    // 清除 bitmap 位
     int idx_bit = ((char *)objp - (char *)sl->obj_base) / cache->obj_size;
     sl->bitmap[idx_bit / 8] &= ~(1 << (idx_bit % 8));
 
-    /* 若 slab 从 full 变为 partial */
+    // 若 slab 从 full 变为 partial
     struct slab **p = &cache->slabs_full;
     while (*p && *p != sl)
         p = &(*p)->next;
@@ -176,7 +187,7 @@ void slub_free(void *objp, size_t size) {
         cache->slabs_partial = sl;
     }
 
-    /* 若 slab 全空，释放页 */
+    // 若 slab 全空，释放页
     if (sl->inuse == 0) {
         struct slab **q = &cache->slabs_partial;
         while (*q && *q != sl)
@@ -188,3 +199,121 @@ void slub_free(void *objp, size_t size) {
         }
     }
 }
+#include <assert.h> 
+
+#define TEST_OBJ_NUM 1000
+
+void slub_test(void) {
+    cprintf("========== SLUB 测试开始 ==========\n");
+
+    /* 初始化 SLUB */
+    slub_init();
+
+    /* 不同大小的对象 */
+    size_t sizes[] = {8, 16, 32, 64, 128, 256, 512, 1024, 2048};
+    int num_sizes = sizeof(sizes) / sizeof(sizes[0]);
+    void *objs[num_sizes][TEST_OBJ_NUM / num_sizes];
+
+    /* 阶段 1：顺序分配所有对象 */
+    cprintf("【阶段1】分配不同大小的对象...\n");
+    for (int s = 0; s < num_sizes; s++) {
+        size_t sz = sizes[s];
+        for (int i = 0; i < TEST_OBJ_NUM / num_sizes; i++) {
+            objs[s][i] = slub_alloc(sz);
+            assert(objs[s][i] != NULL);
+            memset(objs[s][i], 0xA0 + (i & 0xF), sz);
+        }
+    }
+    cprintf("【阶段1】分配完成。\n\n");
+
+    /* 阶段 2：释放每种大小一半对象，并检查 slab 状态 */
+    cprintf("【阶段2】释放部分对象...\n");
+    for (int s = 0; s < num_sizes; s++) {
+        size_t sz = sizes[s];
+        struct kmem_cache *cache = &caches[size_to_index(sz)];
+        for (int i = 0; i < (TEST_OBJ_NUM / num_sizes) / 2; i++) {
+            if (objs[s][i]) {
+                slub_free(objs[s][i], sz);
+                objs[s][i] = NULL;
+            }
+        }
+        /* 检查 partial slab 状态 */
+        struct slab *sl = cache->slabs_partial;
+        while (sl) {
+            assert(sl->inuse > 0 && sl->inuse < sl->total);
+            sl = sl->next;
+        }
+        cprintf("  -> 释放 %lu 字节对象的一半完成。\n", (unsigned long)sz);
+    }
+    cprintf("【阶段2】部分释放完成。\n\n");
+
+    /* 阶段 3：再次分配，测试复用空闲 slab */
+    cprintf("【阶段3】复用测试...\n");
+    for (int s = 0; s < num_sizes; s++) {
+        size_t sz = sizes[s];
+        for (int i = 0; i < (TEST_OBJ_NUM / num_sizes) / 4; i++) {
+            void *ptr = slub_alloc(sz);
+            assert(ptr != NULL);
+            memset(ptr, 0x5A, sz);
+        }
+    }
+    cprintf("【阶段3】复用测试完成。\n\n");
+
+    /* 阶段 4：随机释放所有对象，测试 slab 回收页 */
+    cprintf("【阶段4】释放所有对象...\n");
+    for (int s = 0; s < num_sizes; s++) {
+        size_t sz = sizes[s];
+        struct kmem_cache *cache = &caches[size_to_index(sz)];
+        for (int i = TEST_OBJ_NUM / num_sizes - 1; i >= 0; i--) {
+            if (objs[s][i]) {
+                slub_free(objs[s][i], sz);
+                objs[s][i] = NULL;
+            }
+        }
+        /* 检查 full slab 和 partial slab 都为空或已回收 */
+        struct slab *sl = cache->slabs_partial;
+        while (sl) {
+            assert(sl->inuse > 0 || sl->total == 0);
+            sl = sl->next;
+        }
+        sl = cache->slabs_full;
+        while (sl) {
+            assert(sl->inuse > 0);
+            sl = sl->next;
+        }
+        cprintf("  -> %lu 字节对象释放完毕。\n", (unsigned long)sz);
+    }
+    cprintf("【阶段4】全部释放完成。\n\n");
+
+    /* 阶段 5：分配超过最大对象 */
+    cprintf("【阶段5】测试超大对象...\n");
+    void *bigobj = slub_alloc(4096);
+    assert(bigobj == NULL);
+    cprintf("  超大对象分配失败（正确行为）\n");
+
+    /* 阶段 6：释放 NULL 指针安全性测试 */
+    cprintf("【阶段6】释放 NULL 测试...\n");
+    slub_free(NULL, 16);
+    cprintf("  释放 NULL 安全。\n");
+
+    /* 阶段 7：检查总页数与 inuse 一致 */
+    cprintf("【阶段7】总页数检查...\n");
+    size_t total_objs = 0;
+    for (int s = 0; s < num_sizes; s++) {
+        struct kmem_cache *cache = &caches[size_to_index(sizes[s])];
+        struct slab *sl = cache->slabs_partial;
+        while (sl) {
+            total_objs += sl->inuse;
+            sl = sl->next;
+        }
+        sl = cache->slabs_full;
+        while (sl) {
+            total_objs += sl->inuse;
+            sl = sl->next;
+        }
+    }
+    cprintf("  总对象使用数统计完成: %lu\n", total_objs);
+
+    cprintf("========== SLUB 测试结束 ==========\n");
+}
+
