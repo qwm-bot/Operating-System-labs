@@ -197,6 +197,7 @@ best_fit_init_memmap(struct Page *base, size_t n) {
         assert(PageReserved(p));
         /*LAB2 EXERCISE 2: YOUR CODE*/ 
         // 清空当前页框的标志和属性信息，并将页框的引用计数设置为0
+        // 学号：2311050
         p->flags = 0;           // 清空标志位
         p->property = 0;        // 清空属性
         set_page_ref(p, 0);     // 引用计数设为0
@@ -211,7 +212,8 @@ best_fit_init_memmap(struct Page *base, size_t n) {
         list_entry_t* le = &free_list;
         while ((le = list_next(le)) != &free_list) {
             struct Page* page = le2page(le, page_link);
-            /*LAB2 EXERCISE 2: YOUR CODE*/ 
+            /*LAB2 EXERCISE 2: YOUR CODE*/
+            // 学号：2311050
             // 1、当base < page时，找到第一个大于base的页，将base插入到它前面，并退出循环
             if (base < page) {
                 list_add_before(le, &(base->page_link));
@@ -249,6 +251,7 @@ best_fit_alloc_pages(size_t n) {
     /*LAB2 EXERCISE 2: YOUR CODE*/ 
     // 遍历空闲链表，查找满足需求的空闲页框
     // 如果找到满足需求的页面，记录该页面以及当前找到的最小连续空闲页框数量
+    // 学号：2311050
     while ((le = list_next(le)) != &free_list) {
         struct Page *p = le2page(le, page_link);
         // 如果当前块大小满足需求，且比之前找到的块更小
@@ -296,6 +299,7 @@ best_fit_free_pages(struct Page *base, size_t n) {
     }
     /*LAB2 EXERCISE 2: YOUR CODE*/ 
     // 设置当前页块的属性为释放的页块数、并将当前页块标记为已分配状态、最后增加nr_free的值
+    // 学号：2311050
     base->property = n;
     SetPageProperty(base);
     nr_free += n;
@@ -326,6 +330,7 @@ best_fit_free_pages(struct Page *base, size_t n) {
         // 4、清除当前页块的属性标记，表示不再是空闲页块
         // 5、从链表中删除当前页块
         // 6、将指针指向前一个空闲页块，以便继续检查合并后的连续空闲页块
+        // 学号：2311050
         if (p + p->property == base) {
             p->property += base->property;
             ClearPageProperty(base);
@@ -850,6 +855,7 @@ extern void slub_test(void);
 2.>struct Page
 - 实验中用struct Page的字段来管理内存状态，对应OS原理中的物理页帧抽象。但是在实验中因实现First-Fit和伙伴系统等物理内存分配算法，需要额外字段记录连续空闲块大小；而原理可能不强调连续分配，比如默认以单页为单位等。
 ## 实验未涉及知识点
+
 
 
 
