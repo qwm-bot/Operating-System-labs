@@ -169,6 +169,260 @@ default_pmm_manager是 First-Fit 内存管理器的接口实例，封装算法�
 - 当前直接按请求大小分割，可能产生无用的小块。
 - 可以改为仅当剩余块大于某个阈值时才分裂，否则整块分配。
 ## 练习2
+## 练习2：实现 Best-Fit 连续物理内存分配算法
+
+### 设计实现过程
+
+Best-Fit算法的核心思想是：**在所有能满足需求的空闲块中，选择大小最接近所需大小的块进行分配**，这样可以减少内存碎片。
+
+#### 1. 数据结构
+
+Best-Fit算法使用与First-Fit相同的数据结构：
+- `free_list`：双向链表，按地址升序存储空闲块
+- `nr_free`：记录空闲页总数
+- 每个空闲块的首页用`property`字段记录块大小
+
+#### 2. 核心函数实现
+
+##### (1) best_fit_init_memmap()
+
+初始化空闲内存块，需要完成的代码：
+
+```c
+static void
+best_fit_init_memmap(struct Page *base, size_t n) {
+    assert(n > 0);
+    struct Page *p = base;
+    for (; p != base + n; p ++) {
+        assert(PageReserved(p));
+        /*LAB2 EXERCISE 2: YOUR CODE*/ 
+        // 清空当前页框的标志和属性信息，并将页框的引用计数设置为0
+        p->flags = 0;           // 清空标志位
+        p->property = 0;        // 清空属性
+        set_page_ref(p, 0);     // 引用计数设为0
+    }
+    base->property = n;
+    SetPageProperty(base);
+    nr_free += n;
+    
+    if (list_empty(&free_list)) {
+        list_add(&free_list, &(base->page_link));
+    } else {
+        list_entry_t* le = &free_list;
+        while ((le = list_next(le)) != &free_list) {
+            struct Page* page = le2page(le, page_link);
+            /*LAB2 EXERCISE 2: YOUR CODE*/ 
+            // 1、当base < page时，找到第一个大于base的页，将base插入到它前面，并退出循环
+            if (base < page) {
+                list_add_before(le, &(base->page_link));
+                break;
+            }
+            // 2、当list_next(le) == &free_list时，若已经到达链表结尾，将base插入到链表尾部
+            else if (list_next(le) == &free_list) {
+                list_add(le, &(base->page_link));
+            }
+        }
+    }
+}
+```
+
+**实现说明**：
+- 遍历所有页面，清空flags和property，设置引用计数为0
+- 将第一个页面的property设置为n（块大小）
+- 按地址升序将空闲块插入链表
+
+##### (2) best_fit_alloc_pages()
+
+分配页面，需要修改为Best-Fit策略：
+
+```c
+static struct Page *
+best_fit_alloc_pages(size_t n) {
+    assert(n > 0);
+    if (n > nr_free) {
+        return NULL;
+    }
+    struct Page *page = NULL;
+    list_entry_t *le = &free_list;
+    size_t min_size = nr_free + 1;  // 初始化为一个不可能的大值
+    
+    /*LAB2 EXERCISE 2: YOUR CODE*/ 
+    // 遍历空闲链表，查找满足需求的空闲页框
+    // 如果找到满足需求的页面，记录该页面以及当前找到的最小连续空闲页框数量
+    while ((le = list_next(le)) != &free_list) {
+        struct Page *p = le2page(le, page_link);
+        // 如果当前块大小满足需求，且比之前找到的块更小
+        if (p->property >= n && p->property < min_size) {
+            min_size = p->property;
+            page = p;
+        }
+    }
+
+    if (page != NULL) {
+        list_entry_t* prev = list_prev(&(page->page_link));
+        list_del(&(page->page_link));
+        if (page->property > n) {
+            struct Page *p = page + n;
+            p->property = page->property - n;
+            SetPageProperty(p);
+            list_add(prev, &(p->page_link));
+        }
+        nr_free -= n;
+        ClearPageProperty(page);
+    }
+    return page;
+}
+```
+
+**实现说明**：
+- 遍历整个空闲链表，找到**满足需求且大小最小**的块
+- 使用`min_size`记录当前找到的最小块大小
+- 分配后若有剩余，将剩余部分重新插入链表
+- 更新空闲页计数
+
+##### (3) best_fit_free_pages()
+
+释放页面并合并相邻空闲块：
+
+```c
+static void
+best_fit_free_pages(struct Page *base, size_t n) {
+    assert(n > 0);
+    struct Page *p = base;
+    for (; p != base + n; p ++) {
+        assert(!PageReserved(p) && !PageProperty(p));
+        p->flags = 0;
+        set_page_ref(p, 0);
+    }
+    /*LAB2 EXERCISE 2: YOUR CODE*/ 
+    // 设置当前页块的属性为释放的页块数、并将当前页块标记为已分配状态、最后增加nr_free的值
+    base->property = n;
+    SetPageProperty(base);
+    nr_free += n;
+
+    if (list_empty(&free_list)) {
+        list_add(&free_list, &(base->page_link));
+    } else {
+        list_entry_t* le = &free_list;
+        while ((le = list_next(le)) != &free_list) {
+            struct Page* page = le2page(le, page_link);
+            if (base < page) {
+                list_add_before(le, &(base->page_link));
+                break;
+            } else if (list_next(le) == &free_list) {
+                list_add(le, &(base->page_link));
+            }
+        }
+    }
+
+    // 尝试向前合并
+    list_entry_t* le = list_prev(&(base->page_link));
+    if (le != &free_list) {
+        p = le2page(le, page_link);
+        /*LAB2 EXERCISE 2: YOUR CODE*/ 
+        // 1、判断前面的空闲页块是否与当前页块是连续的
+        // 2、如果是连续的，则将当前页块合并到前面的空闲页块中
+        // 3、首先更新前一个空闲页块的大小，加上当前页块的大小
+        // 4、清除当前页块的属性标记，表示不再是空闲页块
+        // 5、从链表中删除当前页块
+        // 6、将指针指向前一个空闲页块，以便继续检查合并后的连续空闲页块
+        if (p + p->property == base) {
+            p->property += base->property;
+            ClearPageProperty(base);
+            list_del(&(base->page_link));
+            base = p;
+        }
+    }
+
+    // 尝试向后合并
+    le = list_next(&(base->page_link));
+    if (le != &free_list) {
+        p = le2page(le, page_link);
+        if (base + base->property == p) {
+            base->property += p->property;
+            ClearPageProperty(p);
+            list_del(&(p->page_link));
+        }
+    }
+}
+```
+
+**实现说明**：
+- 设置释放块的property为n，标记为有效空闲块
+- 按地址升序插入空闲链表
+- **向前合并**：检查前一个块是否与当前块连续
+- **向后合并**：检查后一个块是否与当前块连续
+
+#### 物理内存分配和释放流程
+
+##### 分配流程
+1. 检查请求页数n是否超过空闲页总数
+2. **遍历整个空闲链表**，找到满足`property >= n`且`property`最小的块
+3. 从链表中删除该块
+4. 如果块大小大于n，将剩余部分作为新的空闲块插入链表
+5. 更新nr_free，清除分配块的PG_property标志
+6. 返回分配块的首页地址
+
+##### 释放流程
+1. 初始化要释放的所有页面
+2. 设置释放块的property为n，标记为有效空闲块
+3. **按地址升序**将块插入空闲链表
+4. **尝试与前一个块合并**：
+   - 如果`前块地址 + 前块大小 == 当前块地址`
+   - 合并：前块大小 += 当前块大小，删除当前块
+5. **尝试与后一个块合并**：
+   - 如果`当前块地址 + 当前块大小 == 后块地址`
+   - 合并：当前块大小 += 后块大小，删除后块
+
+### 测试结果
+<img width="1697" height="213" alt="image" src="https://github.com/user-attachments/assets/f250ef02-fe27-4794-b422-0fab968b50ce" />
+
+
+### Best-Fit算法的改进空间
+
+#### 1. **使用更高效的数据结构**
+**当前问题**：遍历整个链表查找最佳匹配块，时间复杂度O(n)
+
+**改进方案**：
+- 使用**平衡二叉搜索树**（如红黑树）或**跳表**按大小组织空闲块
+- 可以在O(log n)时间内找到满足需求的最小块
+- Linux的SLUB分配器就使用了类似的优化策略
+
+#### 2. **分级空闲链表（Segregated Free Lists）**
+**改进方案**：
+- 将空闲块按大小范围分成多个链表
+- 例如：[1-4页]、[5-16页]、[17-64页]、[65+页]
+- 分配时直接在对应大小范围的链表中查找
+- 可以显著减少遍历次数
+
+#### 3. **阈值策略**
+**当前问题**：即使块比需求大很多，只要是最小的就会分配
+
+**改进方案**：
+- 设置一个阈值（如需求的1.5倍）
+- 如果找到的块大小在阈值内，直接分配
+- 否则继续查找，避免产生太多小碎片
+
+#### 4. **延迟合并（Lazy Coalescing）**
+**当前问题**：每次释放都尝试合并，可能造成不必要的开销
+
+**改进方案**：
+- 释放时不立即合并，而是在分配失败时才触发全局合并
+- 可以减少频繁分配释放场景下的合并开销
+- 类似于垃圾回收的延迟策略
+
+#### 5. **快速路径优化**
+**改进方案**：
+- 缓存上次分配的位置，下次从该位置开始搜索
+- 对于频繁分配的固定大小，维护专门的快速分配池
+- 类似于SLUB中的per-CPU缓存机制
+
+#### 6. **内存碎片整理**
+**改进方案**：
+- 定期或在内存紧张时，进行内存碎片整理
+- 将使用中的块移动到一起，合并空闲块
+- 需要考虑页面迁移的成本和复杂性
+。
 ## 扩展练习Challenge：buddy system（伙伴系统）分配算法（需要编程）
 >Buddy System算法把系统中的可用存储空间划分为存储块(Block)来进行管理, 每个存储块的大小必须是2的n次幂(Pow(2, n)), 即1, 2, 4, 8, 16, 32, 64, 128...参考伙伴分配器的一个极简实现， 在ucore中实现buddy system分配算法，要求有比较充分的测试用例说明实现的正确性，需要有设计文档。
 ### 伙伴系统分配算法
@@ -596,4 +850,5 @@ extern void slub_test(void);
 2.>struct Page
 - 实验中用struct Page的字段来管理内存状态，对应OS原理中的物理页帧抽象。但是在实验中因实现First-Fit和伙伴系统等物理内存分配算法，需要额外字段记录连续空闲块大小；而原理可能不强调连续分配，比如默认以单页为单位等。
 ## 实验未涉及知识点
+
 
