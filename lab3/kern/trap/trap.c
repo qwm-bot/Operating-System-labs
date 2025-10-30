@@ -8,8 +8,11 @@
 #include <riscv.h>
 #include <stdio.h>
 #include <trap.h>
+#include <sbi.h>  // 需要包含sbi.h来使用关机函数
 
 #define TICK_NUM 100
+
+static int num = 0;        // 打印次数计数器
 
 static void print_ticks() {
     cprintf("%d ticks\n", TICK_NUM);
@@ -19,35 +22,12 @@ static void print_ticks() {
 #endif
 }
 
-/* idt_init - initialize IDT to each of the entry points in kern/trap/vectors.S
- */
+/* idt_init - initialize IDT to each of the entry points in kern/trap/vectors.S */
 void idt_init(void) {
-    /* LAB3 YOUR CODE : STEP 2 */
-    /* (1) Where are the entry addrs of each Interrupt Service Routine (ISR)?
-     *     All ISR's entry addrs are stored in __vectors. where is uintptr_t
-     * __vectors[] ?
-     *     __vectors[] is in kern/trap/vector.S which is produced by
-     * tools/vector.c
-     *     (try "make" command in lab3, then you will find vector.S in kern/trap
-     * DIR)
-     *     You can use  "extern uintptr_t __vectors[];" to define this extern
-     * variable which will be used later.
-     * (2) Now you should setup the entries of ISR in Interrupt Description
-     * Table (IDT).
-     *     Can you see idt[256] in this file? Yes, it's IDT! you can use SETGATE
-     * macro to setup each item of IDT
-     * (3) After setup the contents of IDT, you will let CPU know where is the
-     * IDT by using 'lidt' instruction.
-     *     You don't know the meaning of this instruction? just google it! and
-     * check the libs/x86.h to know more.
-     *     Notice: the argument of lidt is idt_pd. try to find it!
-     */
-
     extern void __alltraps(void);
-    /* Set sup0 scratch register to 0, indicating to exception vector
-       that we are presently executing in the kernel */
+    /* 将sup0 scratch寄存器设置为0，向异常向量表明我们当前正在内核中执行 */
     write_csr(sscratch, 0);
-    /* Set the exception vector address */
+    /* 设置异常向量地址 */
     write_csr(stvec, &__alltraps);
 }
 
@@ -124,12 +104,30 @@ void interrupt_handler(struct trapframe *tf) {
             // In fact, Call sbi_set_timer will clear STIP, or you can clear it
             // directly.
             // cprintf("Supervisor timer interrupt\n");
-             /* LAB3 EXERCISE1   YOUR CODE :  */
+            /* LAB3 EXERCISE1   YOUR CODE :  */
             /*(1)设置下次时钟中断- clock_set_next_event()
              *(2)计数器（ticks）加一
              *(3)当计数器加到100的时候，我们会输出一个`100ticks`表示我们触发了100次时钟中断，同时打印次数（num）加一
             * (4)判断打印次数，当打印次数为10时，调用<sbi.h>中的关机函数关机
             */
+            
+            // (1) 设置下次时钟中断
+            clock_set_next_event();
+            
+            // (2) 计数器加一
+            ticks++;
+            
+            // (3) 每100次时钟中断输出一次
+            if (ticks % TICK_NUM == 0) {
+                print_ticks();  // 输出"100 ticks"
+                num++;          // 打印次数加一
+                
+                // (4) 打印10次后关机
+                if (num == 10) {
+                    cprintf("Reached 10 times, shutting down...\n");
+                    sbi_shutdown();  // 调用关机函数
+                }
+            }
             break;
         case IRQ_H_TIMER:
             cprintf("Hypervisor software interrupt\n");
