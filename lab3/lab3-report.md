@@ -6,6 +6,18 @@
 ## 练习1:完善中断处理（需要编程）
 > 请编程完善trap.c中的中断处理函数trap，在对时钟中断进行处理的部分填写kern/trap/trap.c函数中处理时钟中断的部分，使操作系统每遇到100次时钟中断后，调用print_ticks子程序，向屏幕上打印一行文字”100 ticks”，在打印完10行后调用sbi.h中的shut_down()函数关机。\
 要求完成问题1提出的相关函数实现，提交改进后的源代码包（可以编译执行），并在实验报告中简要说明实现过程和定时器中断中断处理的流程。实现要求的部分代码后，运行整个系统，大约每1秒会输出一次”100 ticks”，输出10行。
+
+- 中断处理主流程
+1. 在 trapentry.S 的 __alltraps 中通过 SAVE_ALL 宏将所有寄存器保存到 trapframe
+2.  调用 trap.c 中的 trap() 函数
+3. trap() 调用 trap_dispatch()，根据中断类型分发给 interrupt_handler()
+4. interrupt_handler() 识别出是 IRQ_S_TIMER 类型中断，执行时钟中断处理逻辑
+5. 处理完毕后，通过 __trapret 恢复寄存器并返回原程序执行
+
+- 具体实现
+1. 完善处理时钟中断的部分。调用 clock_set_next_event() 设置下一次时钟中断，设置ticks 计数器自增。
+2. 判断ticks是否达到100的倍数。如果是，调用 print_ticks() 打印信息，num 计数器增加，随后判断 num 是否达到10，如果是就调用 sbi_shutdown() 关机
+
 ## 扩展练习 Challenge1：描述与理解中断流程
 >回答：描述ucore中处理中断异常的流程（从异常的产生开始），其中mov a0，sp的目的是什么？SAVE_ALL中寄存器保存在栈中的位置是什么确定的？对于任何中断，__alltraps 中都需要保存所有寄存器吗？请说明理由。
 - ucore中处理中断异常的流程：
