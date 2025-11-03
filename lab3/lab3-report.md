@@ -72,8 +72,187 @@
     当然，从理论上讲，不同中断所要修改的寄存器不同且提前已知，我们可以先保存少量寄存器，然后用这些少量的寄存器判断中断的类型，从而有选择性的保存更多的寄存器，但这与我们目前代码的逻辑就不太相同了，实现起来也更为复杂。如果按照当前先保存寄存器后判断中断类型的逻辑来说，任何中断都必须保存全部的寄存器，因为提前根本无法判断哪些寄存器会被修改。
 ## 扩展练习 Challenge2：理解上下文切换机制
 >回答：在trapentry.S中汇编代码 csrw sscratch, sp；csrrw s0, sscratch, x0实现了什么操作，目的是什么？save all里面保存了stval scause这些csr，而在restore all里面却不还原它们？那这样store的意义何在呢？
+
+### 问题分析
+
+#### 1. `csrw sscratch, sp; csrrw s0, sscratch, x0` 的操作与目的
+
+这两条指令实现了**sp寄存器的交换操作**:
+
+```asm
+csrw sscratch, sp      # 将当前sp保存到sscratch CSR中
+csrrw s0, sscratch, x0 # 将sscratch的值读入s0,同时将x0(值为0)写入sscratch
+```
+
+**操作过程:**
+1. 第一条指令将当前的栈指针sp保存到sscratch寄存器
+2. 第二条指令将sscratch的值(即原来的sp)读入s0寄存器,同时清空sscratch
+
+**目的:**
+- **区分内核态和用户态**: sscratch寄存器用于保存用户态的栈指针或内核态的trapframe地址
+- **快速切换栈指针**: 在陷入中断时,需要快速从用户栈切换到内核栈
+- **保存上下文信息**: 将用户态的sp保存起来,以便后续恢复
+
+在RISC-V的设计中,sscratch是专门用于在特权级切换时保存关键信息的"暂存器"。
+
+#### 2. SAVE_ALL保存但RESTORE_ALL不还原stval/scause的原因
+
+**为什么要保存stval和scause?**
+- **stval (Supervisor Trap Value)**: 保存导致异常的地址或指令
+- **scause (Supervisor Cause)**: 保存异常/中断的原因代码
+
+这些CSR在中断处理过程中需要被读取,以判断异常类型和位置。保存它们的意义在于:
+
+1. **传递给C语言处理函数**: trap.c中的`trap()`函数需要这些信息来判断如何处理异常
+2. **保持trapframe结构完整**: trapframe结构需要记录完整的中断现场
+3. **调试和日志记录**: 便于输出异常信息
+
+**为什么不需要还原?**
+
+关键原因是:**这些CSR是硬件自动设置的,不需要软件还原**
+
+- 当下一次异常/中断发生时,硬件会自动更新这些CSR
+- 它们是**只读(从软件角度)或硬件管理**的状态信息
+- 还原它们没有意义,因为它们反映的是"当前异常"的信息,而不是需要恢复的进程状态
+
+相比之下,通用寄存器(x0-x31)、sepc(返回地址)、sstatus(状态寄存器)等需要还原,因为它们是程序执行状态的一部分。
+
+### 代码实现位置
+
+相关代码在`kern/trap/trapentry.S`中:
+
+```asm
+__alltraps:
+    SAVE_ALL  # 保存所有寄存器和CSR
+    
+    move a0, sp
+    jal trap  # 调用C语言处理函数
+    
+__trapret:
+    RESTORE_ALL  # 只还原需要还原的寄存器
+    sret
+```
+
+
 ## 扩展练习Challenge3：完善异常中断(需要编程)
 >编程完善在触发一条非法指令异常 mret和，在 kern/trap/trap.c的异常处理函数中捕获，并对其进行处理，简单输出异常类型和异常指令触发地址，即“Illegal instruction caught at 0x(地址)”，“ebreak caught at 0x（地址）”与“Exception type:Illegal instruction"，“Exception type: breakpoint”。
+
+### 实现思路
+
+需要在`kern/trap/trap.c`中添加对非法指令异常和断点异常的处理:
+
+1. **非法指令异常**: CAUSE_ILLEGAL_INSTRUCTION (2)
+2. **断点异常**: CAUSE_BREAKPOINT (3)
+
+### 代码实现
+
+#### 1. 修改 trap.c 添加异常处理
+
+在`trap_dispatch()`函数中添加异常处理分支:
+
+```c
+void trap_dispatch(struct trapframe *tf) {
+    if ((intptr_t)tf->cause < 0) {
+        // 中断处理
+        interrupt_handler(tf);
+    } else {
+        // 异常处理
+        exception_handler(tf);
+    }
+}
+
+static void exception_handler(struct trapframe *tf) {
+    switch (tf->cause) {
+        case CAUSE_ILLEGAL_INSTRUCTION:
+            cprintf("Exception type: Illegal instruction\n");
+            cprintf("Illegal instruction caught at 0x%016llx\n", tf->epc);
+            // 跳过非法指令,继续执行(epc += 4)
+            tf->epc += 4;
+            break;
+            
+        case CAUSE_BREAKPOINT:
+            cprintf("Exception type: breakpoint\n");
+            cprintf("ebreak caught at 0x%016llx\n", tf->epc);
+            // 跳过ebreak指令
+            tf->epc += 2;  // ebreak是2字节的压缩指令
+            break;
+            
+        default:
+            print_trapframe(tf);
+            break;
+    }
+}
+```
+
+#### 2. 添加测试代码触发异常
+
+在`kern/init/init.c`的`kern_init()`函数中添加测试:
+
+```c
+int kern_init(void) {
+    extern char edata[], end[];
+    memset(edata, 0, end - edata);
+    
+    cons_init();
+    const char *message = "(THU.CST) os is loading ...\n";
+    cprintf("%s\n\n", message);
+    
+    print_kerninfo();
+    
+    idt_init();
+    
+    // 测试非法指令异常
+    cprintf("\n==== Testing Illegal Instruction ====\n");
+    __asm__ __volatile__("mret");  // mret在S模式下是非法指令
+    
+    // 测试断点异常
+    cprintf("\n==== Testing Breakpoint ====\n");
+    __asm__ __volatile__("ebreak");
+    
+    cprintf("\nAll exceptions handled successfully!\n\n");
+    
+    clock_init();
+    intr_enable();
+    
+    while (1)
+        ;
+}
+```
+
+### 运行结果
+![alt text](image.png)
+
+### 关键技术点说明
+
+#### 1. 异常类型判断
+```c
+// cause的最高位表示是中断(1)还是异常(0)
+if ((intptr_t)tf->cause < 0) {
+    // 中断
+} else {
+    // 异常
+}
+```
+
+#### 2. 异常码定义
+根据RISC-V规范:
+- `CAUSE_ILLEGAL_INSTRUCTION = 2`: 非法指令
+- `CAUSE_BREAKPOINT = 3`: 断点异常
+
+#### 3. EPC调整
+
+**为什么需要调整EPC?**
+- 异常处理完后,如果不调整epc,会重复执行导致异常的指令
+- 对于非法指令,通常跳过该指令(+4字节)
+- 对于ebreak,如果是调试用途可能需要停止,这里选择跳过(+2字节)
+
+**指令长度:**
+- 标准RISC-V指令: 4字节
+- 压缩指令(如ebreak): 2字节
+
+---
+
+
 ## 实验涉及的知识点
 
 1. **异常与中断的基本概念**  
