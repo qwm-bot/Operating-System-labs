@@ -82,7 +82,7 @@
 根据 `kern/trap/trapentry.S` 中 `SAVE_ALL` 宏的实现，实际的流程是：
 
 1.  **`csrw sscratch, sp`**
-    * **操作**：这是一条 CSR（Control and Status Register）写入指令。它将 `sp` 寄存器（x2）的**当前值**（即中断前的栈指针，例如用户栈指针 `usp`），**写入（备份）**到 `sscratch` 这个 CSR 寄存器中。
+    * **操作**：这是一条 CSR（Control and Status Register）写入指令。它将 `sp` 寄存器（x2）的**当前值**（即中断前的栈指针，例如用户栈指针 `usp`），写入（备份）到 `sscratch` 这个 CSR 寄存器中。
     * **目的**：**备份原始栈指针**。因为 `sp` 寄存器马上要被 `addi` 指令修改，所以必须先把它的原始值暂存到一个安全的地方。
 
 2.  **`addi sp, sp, -36 * REGBYTES`**
