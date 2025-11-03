@@ -117,7 +117,7 @@
     紧接着，汇编代码执行 `move a0, sp` 和 `jal trap`。
     * `move a0, sp`：将 `trapframe` 的地址作为第一个参数（`a0`）。
     * `jal trap`：调用 C 函数 `trap(struct trapframe *tf)`。
-    * 在 `trap.c` 中，C 代码需要通过 `tf->cause` (`scause`) 才能知道**“发生了什么”**（例如 `case IRQ_S_TIMER:` 或 `case CAUSE_ILLEGAL_INSTRUCTION:`），通过 `tf->badvaddr` (`stval`) 才能知道错误相关的地址。
+    * 在 `trap.c` 中，C 代码需要通过 `tf->cause` (`scause`) 才能知道“发生了什么”（例如 `case IRQ_S_TIMER:` 或 `case CAUSE_ILLEGAL_INSTRUCTION:`），通过 `tf->badvaddr` (`stval`) 才能知道错误相关的地址。
     * 如果**不保存**它们，C 语言的 `trap` 函数将无法判断异常或中断的类型，也就无法进行后续处理。
 
 2.  **它们是“事件报告”，不是“程序状态”**：
