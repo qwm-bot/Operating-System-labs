@@ -22,12 +22,16 @@ static void print_ticks() {
 #endif
 }
 
+/* idt_init - initialize IDT to each of the entry points in kern/trap/vectors.S */
 void idt_init(void) {
     extern void __alltraps(void);
+    /* 将sup0 scratch寄存器设置为0，向异常向量表明我们当前正在内核中执行 */
     write_csr(sscratch, 0);
+    /* 设置异常向量地址 */
     write_csr(stvec, &__alltraps);
 }
 
+/* trap_in_kernel - test if trap happened in kernel */
 bool trap_in_kernel(struct trapframe *tf) {
     return (tf->status & SSTATUS_SPP) != 0;
 }
@@ -95,17 +99,33 @@ void interrupt_handler(struct trapframe *tf) {
             cprintf("User Timer interrupt\n");
             break;
         case IRQ_S_TIMER:
-            // 练习1: 时钟中断处理
+            // "All bits besides SSIP and USIP in the sip register are
+            // read-only." -- privileged spec1.9.1, 4.1.4, p59
+            // In fact, Call sbi_set_timer will clear STIP, or you can clear it
+            // directly.
+            // cprintf("Supervisor timer interrupt\n");
+            /* LAB3 EXERCISE1   YOUR CODE :  */
+            /*(1)设置下次时钟中断- clock_set_next_event()
+             *(2)计数器（ticks）加一
+             *(3)当计数器加到100的时候，我们会输出一个`100ticks`表示我们触发了100次时钟中断，同时打印次数（num）加一
+            * (4)判断打印次数，当打印次数为10时，调用<sbi.h>中的关机函数关机
+            */
+            
+            // (1) 设置下次时钟中断
             clock_set_next_event();
+            
+            // (2) 计数器加一
             ticks++;
             
+            // (3) 每100次时钟中断输出一次
             if (ticks % TICK_NUM == 0) {
-                print_ticks();
-                num++;
+                print_ticks();  // 输出"100 ticks"
+                num++;          // 打印次数加一
                 
+                // (4) 打印10次后关机
                 if (num == 10) {
                     cprintf("Reached 10 times, shutting down...\n");
-                    sbi_shutdown();
+                    sbi_shutdown();  // 调用关机函数
                 }
             }
             break;
@@ -140,18 +160,28 @@ void exception_handler(struct trapframe *tf) {
         case CAUSE_FAULT_FETCH:
             break;
         case CAUSE_ILLEGAL_INSTRUCTION:
-            // LAB3 CHALLENGE3: 非法指令异常处理
+             // 非法指令异常处理
+             /* LAB3 CHALLENGE3   2311050 :  */
+            /*(1)输出指令异常类型（ Illegal instruction）
+             *(2)输出异常指令地址
+             *(3)更新 tf->epc寄存器
+            */
             cprintf("Exception type: Illegal instruction\n");
             cprintf("Illegal instruction caught at 0x%016lx\n", tf->epc);
-            // 更新epc,跳过非法指令(假设是4字节标准指令)
+            // 更新epc，跳过非法指令（mret是4字节标准指令）
             tf->epc += 4;
             break;
         case CAUSE_BREAKPOINT:
-        cprintf("Exception type: breakpoint\n");
-        cprintf("ebreak caught at 0x%016lx\n", tf->epc);
-        uint16_t instr = *(uint16_t *)(tf->epc);
-        tf->epc += ((instr & 0x3) != 0x3) ? 2 : 4;
-        break;
+            //断点异常处理
+            /* LAB3 CHALLLENGE3   2311050:  */
+            /*(1)输出指令异常类型（ breakpoint）
+             *(2)输出异常指令地址
+             *(3)更新 tf->epc寄存器
+            */
+            cprintf("Exception type: breakpoint\n");
+            cprintf("ebreak caught at 0x%016lx\n", tf->epc);
+            // 更新epc，跳过ebreak指令（2字节压缩指令）
+            tf->epc += 2;
             break;
         case CAUSE_MISALIGNED_LOAD:
             break;
@@ -185,6 +215,13 @@ static inline void trap_dispatch(struct trapframe *tf) {
     }
 }
 
+/* *
+ * trap - handles or dispatches an exception/interrupt. if and when trap()
+ * returns,
+ * the code in kern/trap/trapentry.S restores the old CPU state saved in the
+ * trapframe and then uses the iret instruction to return from the exception.
+ * */
 void trap(struct trapframe *tf) {
+    // dispatch based on what type of trap occurred
     trap_dispatch(tf);
 }
