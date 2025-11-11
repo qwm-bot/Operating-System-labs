@@ -103,15 +103,37 @@ void interrupt_handler(struct trapframe *tf)
     case IRQ_U_TIMER:
         cprintf("User software interrupt\n");
         break;
-    case IRQ_S_TIMER:
-        // "All bits besides SSIP and USIP in the sip register are
-        // read-only." -- privileged spec1.9.1, 4.1.4, p59
-        // In fact, Call sbi_set_timer will clear STIP, or you can clear it
-        // directly.
-        // clear_csr(sip, SIP_STIP);
-
-        /*LAB3 请补充你在lab3中的代码 */ 
-        break;
+        case IRQ_S_TIMER:
+            // "All bits besides SSIP and USIP in the sip register are
+            // read-only." -- privileged spec1.9.1, 4.1.4, p59
+            // In fact, Call sbi_set_timer will clear STIP, or you can clear it
+            // directly.
+            // cprintf("Supervisor timer interrupt\n");
+            /* LAB3 EXERCISE1   YOUR CODE :  */
+            /*(1)设置下次时钟中断- clock_set_next_event()
+             *(2)计数器（ticks）加一
+             *(3)当计数器加到100的时候，我们会输出一个`100ticks`表示我们触发了100次时钟中断，同时打印次数（num）加一
+            * (4)判断打印次数，当打印次数为10时，调用<sbi.h>中的关机函数关机
+            */
+            
+            // (1) 设置下次时钟中断
+            clock_set_next_event();
+            
+            // (2) 计数器加一
+            ticks++;
+            
+            // (3) 每100次时钟中断输出一次
+            if (ticks % TICK_NUM == 0) {
+                print_ticks();  // 输出"100 ticks"
+                num++;          // 打印次数加一
+                
+                // (4) 打印10次后关机
+                if (num == 10) {
+                    cprintf("Reached 10 times, shutting down...\n");
+                    sbi_shutdown();  // 调用关机函数
+                }
+            }
+            break;
     case IRQ_H_TIMER:
         cprintf("Hypervisor software interrupt\n");
         break;
