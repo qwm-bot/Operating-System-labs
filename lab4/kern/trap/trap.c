@@ -9,9 +9,10 @@
 #include <stdio.h>
 #include <trap.h>
 #include <vmm.h>
+#include <sbi.h>
 
 #define TICK_NUM 100
-
+int num = 0; // 记录打印次数
 static void print_ticks()
 {
     cprintf("%d ticks\n", TICK_NUM);
