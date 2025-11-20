@@ -22,7 +22,7 @@ proc->state = PROC_UNINIT;          // 进程状态：未初始化
         proc->mm = NULL;                      // 内存管理结构：内核线程不需要
         memset(&(proc->context), 0, sizeof(struct context)); // 上下文清零
         proc->tf = NULL;                      // 陷阱帧指针：未设置
-        proc->pgdir = boot_pgdir_pa;                   // 页目录基址：未分配
+        proc->pgdir = boot_pgdir_pa;          // 页目录基址，让新创建的进程初始时共享内核的页表结构
         proc->flags = 0;                      // 进程标志：0
         memset(proc->name, 0, PROC_NAME_LEN + 1); // 进程名清零
 ```
