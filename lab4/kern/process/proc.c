@@ -113,7 +113,7 @@ alloc_proc(void)
         proc->mm = NULL;                      // 内存管理结构：内核线程不需要
         memset(&(proc->context), 0, sizeof(struct context)); // 上下文清零
         proc->tf = NULL;                      // 陷阱帧指针：未设置
-        proc->pgdir = NULL;                   // 页目录基址：未分配
+        proc->pgdir = boot_pgdir_pa;                  // 页目录基址：未分配//change!!!
         proc->flags = 0;                      // 进程标志：0
         memset(proc->name, 0, PROC_NAME_LEN + 1); // 进程名清零
     }
@@ -184,6 +184,8 @@ get_pid(void)
 // NOTE: before call switch_to, should load  base addr of "proc"'s new PDT
 // proc_run - make process "proc" running on cpu
 // NOTE: before call switch_to, should load  base addr of "proc"'s new PDT
+// proc_run - make process "proc" running on cpu
+// NOTE: before call switch_to, should load  base addr of "proc"'s new PDT
 void proc_run(struct proc_struct *proc) {
     if (proc != current) {
         bool intr_flag;
@@ -191,15 +193,23 @@ void proc_run(struct proc_struct *proc) {
         local_intr_save(intr_flag);
         {
             current = proc;
-            // 使用 lsatp 切换 RISC-V 的页表
-            lsatp(SATP_SV39 | (next->pgdir >> RISCV_PGSHIFT));
-            // 切换上下文
+            // LAB4:EXERCISE1 YOUR CODE
+            // 1. 设置 satp 寄存器以切换页表
+            //    使用 write_csr 宏直接写入 satp
+            //    ((uintptr_t)SATP_MODE_SV39 << 60): 设置 satp 的 Mode 字段为 SV39 (8)
+            //    (next->pgdir >> RISCV_PGSHIFT): 将页目录物理地址转换为 PPN (物理页号)
+            uintptr_t satp_val = ((uintptr_t)SATP_MODE_SV39 << 60) | (next->pgdir >> RISCV_PGSHIFT);
+            write_csr(satp, satp_val);
+
+            // 2. 刷新 TLB (可选，但切换页表后通常建议刷新，虽然 RISC-V 在 satp 写入时会自动处理 ASID 相关的，但这里是简单实现)
+            //    asm volatile("sfence.vma"); 
+            
+            // 3. 切换上下文
             switch_to(&(prev->context), &(next->context));
         }
         local_intr_restore(intr_flag);
     }
 }
-
 // forkret -- the first kernel entry point of a new thread/process
 // NOTE: the addr of forkret is setted in copy_thread function
 //       after switch_to, the current proc will execute here.
