@@ -1,7 +1,7 @@
 # LAB4——进程管理
 ## 练习0：填写已有实验
 > 本实验依赖实验2/3。请把你做的实验2/3的代码填入本实验中代码中有“LAB2”,“LAB3”的注释相应部分。
-> 我们主要将trap.c的中断逻辑进行补充：
+我们主要将trap.c的中断逻辑进行补充：
 ```c
 case IRQ_U_TIMER:
         cprintf("User software interrupt\n");
@@ -37,7 +37,7 @@ case IRQ_U_TIMER:
                 }
             }
             break;
-```c
+```
 ## 练习1：分配并初始化一个进程控制块（需要编码）
 >`alloc_proc`函数（位于`kern/process/proc.c`中）负责分配并返回一个新的`struct proc_struct`结构，用于存储新建立的内核线程的管理信息。ucore需要对这个结构进行最基本的初始化，你需要完成这个初始化过程。
 >
