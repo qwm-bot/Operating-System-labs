@@ -1,7 +1,8 @@
 # LAB4——进程管理
 ## 练习0：填写已有实验
 > 本实验依赖实验2/3。请把你做的实验2/3的代码填入本实验中代码中有“LAB2”,“LAB3”的注释相应部分。
-我们主要将trap.c的中断逻辑进行补充：
+
+针对练习0，我们主要将trap.c的中断逻辑进行补充：
 ```c
 case IRQ_U_TIMER:
         cprintf("User software interrupt\n");
