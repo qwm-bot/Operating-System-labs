@@ -1,2 +1,4 @@
 # --- Zone.Identifier（Windows拉下来的文件标签）---
 *:Zone.Identifier
+obj/
+doc/
