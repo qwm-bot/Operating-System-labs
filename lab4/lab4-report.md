@@ -359,9 +359,11 @@ void proc_run(struct proc_struct *proc) {
           * `schedule()` 函数会遍历运行队列，找到状态为 `PROC_RUNNABLE` 的 `initproc`。
           * 接着调用我们编写的 `proc_run(initproc)`，完成上下文切换。
           * CPU 开始执行 `initproc`，最终进入 `init_main` 函数，在控制台输出 "Hello world\!\!" 等字符串。
+            
 ### 结果展示
 我们make qemu的结果如下：
 <img width="834" height="892" alt="image" src="https://github.com/user-attachments/assets/e4b58a92-3e66-4959-b71d-08fb0949831f" />
+
 make grade的结果如下：
 <img width="887" height="397" alt="image" src="https://github.com/user-attachments/assets/47f9d6ac-d163-4d3a-b840-f75b98bb2d91" />
 
