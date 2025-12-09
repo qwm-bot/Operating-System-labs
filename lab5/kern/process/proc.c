@@ -89,7 +89,7 @@ alloc_proc(void)
     struct proc_struct *proc = kmalloc(sizeof(struct proc_struct));
     if (proc != NULL)
     {
-        // LAB4:EXERCISE1 YOUR CODE
+        // LAB4:EXERCISE1 
         /*
          * below fields in proc_struct need to be initialized
          *       enum proc_state state;                      // Process state
@@ -729,10 +729,8 @@ load_icode(unsigned char *binary, size_t size)
 
     //(6) setup trapframe for user environment
     struct trapframe *tf = current->tf;
-    // Keep sstatus
-    uintptr_t sstatus = tf->status;
     memset(tf, 0, sizeof(struct trapframe));
-    /* LAB5:EXERCISE1 YOUR CODE
+    /* LAB5:EXERCISE1 2311089
      * should set tf->gpr.sp, tf->epc, tf->status
      * NOTICE: If we set trapframe correctly, then the user level process can return to USER MODE from kernel. So
      *          tf->gpr.sp should be user stack top (the value of sp)
@@ -740,6 +738,16 @@ load_icode(unsigned char *binary, size_t size)
      *          tf->status should be appropriate for user program (the value of sstatus)
      *          hint: check meaning of SPP, SPIE in SSTATUS, use them by SSTATUS_SPP, SSTATUS_SPIE(defined in risv.h)
      */
+    tf->gpr.sp = USTACKTOP;           // 用户栈指针
+    tf->epc = elf->e_entry;           // 程序入口地址
+
+    // 设置sstatus寄存器
+    uintptr_t sstatus = read_csr(sstatus);
+    // 清除SPP位（设置为用户态），开启中断
+    sstatus &= ~SSTATUS_SPP;    // 清除SPP，表示从用户态进入
+    sstatus |= SSTATUS_SPIE;   // 设置SPIE，允许中断
+    sstatus &= ~SSTATUS_SIE;    // 清除SIE，在内核中禁用中断
+    tf->status = sstatus;
 
     ret = 0;
 out:
