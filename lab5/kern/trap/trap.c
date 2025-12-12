@@ -227,7 +227,22 @@ void exception_handler(struct trapframe *tf)
         cprintf("Load page fault\n");
         break;
     case CAUSE_STORE_PAGE_FAULT:
-        cprintf("Store/AMO page fault\n");
+        if (current != NULL && current->mm != NULL)
+        {
+            int ret = do_pgfault(current->mm, tf->cause, tf->tval);
+            if (ret != 0)
+            {
+                cprintf("Unhandled page fault: va=0x%lx cause=%ld err=%d\n", tf->tval, tf->cause, ret);
+                print_trapframe(tf);
+                do_exit(-E_KILLED);
+            }
+        }
+        else
+        {
+            cprintf("Kernel page fault at va=0x%lx\n", tf->tval);
+            print_trapframe(tf);
+            panic("unhandled kernel page fault");
+        }
         break;
     default:
         print_trapframe(tf);

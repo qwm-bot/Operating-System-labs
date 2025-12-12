@@ -378,55 +378,89 @@ int copy_range(pde_t *to, pde_t *from, uintptr_t start, uintptr_t end,
 {
     assert(start % PGSIZE == 0 && end % PGSIZE == 0);
     assert(USER_ACCESS(start, end));
-    // copy content by page unit.
-    do
-    {
+
+    do {
         // call get_pte to find process A's pte according to the addr start
         pte_t *ptep = get_pte(from, start, 0), *nptep;
-        if (ptep == NULL)
-        {
+        if (ptep == NULL) {
             start = ROUNDDOWN(start + PTSIZE, PTSIZE);
             continue;
         }
-        // call get_pte to find process B's pte according to the addr start. If
-        // pte is NULL, just alloc a PT
-        if (*ptep & PTE_V)
-        {
-            if ((nptep = get_pte(to, start, 1)) == NULL)
-            {
+
+        // call get_pte to find process B's pte according to the addr start.
+        // If pte is NULL, just alloc a PT
+        if (*ptep & PTE_V) {
+
+            if ((nptep = get_pte(to, start, 1)) == NULL) {
                 return -E_NO_MEM;
             }
-            uint32_t perm = (*ptep & PTE_USER);
-            // get page from ptep
-            struct Page *page = pte2page(*ptep);
-            // alloc a page for process B
-            struct Page *npage = alloc_page();
-            assert(page != NULL);
-            assert(npage != NULL);
-            int ret = 0;
-            /* LAB5:EXERCISE2 YOUR CODE
-             * replicate content of page to npage, build the map of phy addr of
-             * nage with the linear addr start
-             *
-             * Some Useful MACROs and DEFINEs, you can use them in below
-             * implementation.
-             * MACROs or Functions:
-             *    page2kva(struct Page *page): return the kernel vritual addr of
-             * memory which page managed (SEE pmm.h)
-             *    page_insert: build the map of phy addr of an Page with the
-             * linear addr la
-             *    memcpy: typical memory copy function
-             *
-             * (1) find src_kvaddr: the kernel virtual address of page
-             * (2) find dst_kvaddr: the kernel virtual address of npage
-             * (3) memory copy from src_kvaddr to dst_kvaddr, size is PGSIZE
-             * (4) build the map of phy addr of  nage with the linear addr start
-             */
 
-            assert(ret == 0);
+            uint32_t perm = (*ptep & PTE_USER);
+            struct Page *page = pte2page(*ptep);
+            assert(page != NULL);
+
+            // ================================
+            //  Case 1: COW mode (share == 1)
+            // ================================
+            if (share) {
+
+                /*
+                 * Enable copy-on-write for writable user mappings by
+                 * removing the write bit from both parent and child
+                 * PTEs and marking them with PTE_COW. Future writes
+                 * will trap and be resolved in the page-fault handler.
+                 */
+
+                if (perm & PTE_W) {
+                    perm = (perm | PTE_COW) & ~PTE_W; // child perm
+                    *ptep = (*ptep & ~PTE_W) | PTE_COW; // parent perm
+                    tlb_invalidate(from, start);
+                }
+
+                // map the same physical page into child
+                int ret = page_insert(to, page, start, perm);
+                if (ret != 0) return ret;
+            }
+
+            // ================================
+            //  Case 2: normal DUP (share == 0)
+            // ================================
+            else {
+
+                // alloc a page for process B
+                struct Page *npage = alloc_page();
+                assert(npage != NULL);
+
+                int ret = 0;
+                /*
+                 * LAB5:EXERCISE2 YOUR CODE
+                 * replicate content of page to npage, build the map of phy addr
+                 * of npage with the linear addr start
+                 *
+                 * Some Useful MACROs and DEFINEs:
+                 *    page2kva(struct Page *page): return the kernel virtual addr
+                 *    page_insert: build the map
+                 *    memcpy: copy memory
+                 *
+                 * (1) find src_kvaddr: the kernel virtual address of page
+                 * (2) find dst_kvaddr: the kernel virtual address of npage
+                 * (3) memcpy size PGSIZE
+                 * (4) map npage at 'start'
+                 */
+
+                void *src = page2kva(page);
+                void *dst = page2kva(npage);
+                memcpy(dst, src, PGSIZE);
+
+                ret = page_insert(to, npage, start, perm);
+                assert(ret == 0);
+            }
         }
+
         start += PGSIZE;
+
     } while (start != 0 && start < end);
+
     return 0;
 }
 

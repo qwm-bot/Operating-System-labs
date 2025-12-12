@@ -253,5 +253,399 @@
 >这个扩展练习涉及到本实验和上一个实验“虚拟内存管理”。在ucore操作系统中，当一个用户父进程创建自己的子进程时，父进程会把其申请的用户空间设置为只读，子进程可共享父进程占用的用户内存空间中的页面（这就是一个共享的资源）。当其中任何一个进程修改此用户内存空间中的某页面时，ucore会通过page fault异常获知该操作，并完成拷贝内存页面，使得两个进程都有各自的内存页面。这样一个进程所做的修改不会被另外一个进程可见了。请在ucore中实现这样的COW机制。
 >
 >由于COW实现比较复杂，容易引入bug，请参考 https://dirtycow.ninja/ 看看能否在ucore的COW实现中模拟这个错误和解决方案。需要有解释。
+
+### 实现要点
+- 在fork拷贝阶段不再逐页复制，而是把可写用户页改成只读+PTE_COW：父子页表权限都去掉PTE_W并加上PTE_COW，子进程直接共享同一物理页。
+- 页故障路径识别“写入COW页”场景：若ref>1则分配新页并复制数据；若ref==1只需去掉PTE_COW恢复PTE_W，无需复制。
+- trap层把load/store page fault交给do_pgfault处理，失败则杀死进程并打印故障信息。
+- 统计pgfault_num以便后续调试，路径在do_pgfault中递增。
+
+```mermaid
+flowchart LR
+    A[Private-W] -- fork (clear PTE_W, set PTE_COW) --> B[Shared-RO-COW]
+    B -- child/parent write & ref>1 --> C[Copy -> Private-W]
+    B -- write & ref==1 --> A
+    C -- further writes --> A
+```
+状态说明：
+- Private-W：独占可写页，常规读写不触发fault。
+- Shared-RO-COW：父子共享页，PTE_W清除、PTE_COW置位，写入触发fault。
+- Copy -> Private-W：COW fault且ref>1时分配新页并复制，映射为可写后回到独占态；ref==1时直接去掉PTE_COW并恢复PTE_W。
+转换事件：fork触发共享；写访问触发COW fault；ref计数决定是复制还是原地升级。
+### 实验源码
+#### `copy_range`的修改
+```c
+int copy_range(pde_t *to, pde_t *from, uintptr_t start, uintptr_t end,bool share)
+{
+    assert(start % PGSIZE == 0 && end % PGSIZE == 0);
+    assert(USER_ACCESS(start, end));
+
+    do {
+        // call get_pte to find process A's pte according to the addr start
+        pte_t *ptep = get_pte(from, start, 0), *nptep;
+        if (ptep == NULL) {
+            start = ROUNDDOWN(start + PTSIZE, PTSIZE);
+            continue;
+        }
+
+        // call get_pte to find process B's pte according to the addr start.
+        // If pte is NULL, just alloc a PT
+        if (*ptep & PTE_V) {
+
+            if ((nptep = get_pte(to, start, 1)) == NULL) {
+                return -E_NO_MEM;
+            }
+
+            uint32_t perm = (*ptep & PTE_USER);
+            struct Page *page = pte2page(*ptep);
+            assert(page != NULL);
+
+            // ================================
+            //  Case 1: COW mode (share == 1)
+            // ================================
+            if (share) {
+
+                /*
+                 * Enable copy-on-write for writable user mappings by
+                 * removing the write bit from both parent and child
+                 * PTEs and marking them with PTE_COW. Future writes
+                 * will trap and be resolved in the page-fault handler.
+                 */
+
+                if (perm & PTE_W) {
+                    perm = (perm | PTE_COW) & ~PTE_W; // child perm
+                    *ptep = (*ptep & ~PTE_W) | PTE_COW; // parent perm
+                    tlb_invalidate(from, start);
+                }
+
+                // map the same physical page into child
+                int ret = page_insert(to, page, start, perm);
+                if (ret != 0) return ret;
+            }
+
+            // ================================
+            //  Case 2: normal DUP (share == 0)
+            // ================================
+            else {
+
+                // alloc a page for process B
+                struct Page *npage = alloc_page();
+                assert(npage != NULL);
+
+                int ret = 0;
+
+                void *src = page2kva(page);
+                void *dst = page2kva(npage);
+                memcpy(dst, src, PGSIZE);
+
+                ret = page_insert(to, npage, start, perm);
+                assert(ret == 0);
+            }
+        }
+
+        start += PGSIZE;
+
+    } while (start != 0 && start < end);
+
+    return 0;
+}
+```
+- 判断与目标：只有原本可写的页面才需要 COW`（if (perm & PTE_W)）`；不可写页无需处理。
+- 子进程处理：`perm = (perm | PTE_COW) & ~PTE_W` —— 给子进程加上 `PTE_COW `标记并去掉写权限，使其成为“只读 + COW”。
+- 父进程处理：`*ptep = (*ptep & ~PTE_W) | PTE_COW` —— 同样撤销父的写权限并标记为 COW，确保父写入时也会触发`page fault`。
+- TLB 刷新：`tlb_invalidate(...)` 用于使刚改的父页权限立即生效，避免旧权限被缓存导致绕过 COW。
+- 共享映射：`page_insert(to, page, start, perm)` 把相同的物理页映射到子进程（不分配新页、不 memcpy），实现“按需复制”的核心优化。
+#### `do_pgfault`的实现
+```c
+int do_pgfault(struct mm_struct *mm, uint32_t error_code, uintptr_t addr)
+{
+    pgfault_num++;
+
+    if (mm == NULL)
+    {
+        return -E_INVAL;
+    }
+    struct vma_struct *vma = find_vma(mm, addr);
+    if (vma == NULL || addr < vma->vm_start)
+    {
+        return -E_INVAL;
+    }
+    uintptr_t la = ROUNDDOWN(addr, PGSIZE);
+    pte_t *ptep = get_pte(mm->pgdir, la, 0);
+    if (ptep == NULL)
+    {
+        return -E_NO_MEM;
+    }
+    // Only handle write faults on COW-marked present pages
+    if ((*ptep & (PTE_V | PTE_COW)) == (PTE_V | PTE_COW) && error_code == CAUSE_STORE_PAGE_FAULT)
+    {
+        struct Page *page = pte2page(*ptep);
+        if (page_ref(page) > 1)
+        {
+            struct Page *npage = alloc_page();
+            if (npage == NULL)
+            {
+                return -E_NO_MEM;
+            }
+            memcpy(page2kva(npage), page2kva(page), PGSIZE);
+            uint32_t perm = (*ptep & PTE_USER) | PTE_W;
+            perm &= ~PTE_COW;
+            int ret = page_insert(mm->pgdir, npage, la, perm);
+            if (ret != 0)
+            {
+                free_page(npage);
+                return ret;
+            }
+        }
+        else
+        {
+            *ptep = (*ptep | PTE_W) & ~PTE_COW;
+            tlb_invalidate(mm->pgdir, la);
+        }
+        return 0;
+    }
+    return -E_INVAL;
+}
+```
+- 当缺页异常发生时，内核首先根据异常地址查找对应的 VMA，并通过 `get_pte()` 获取页表项。如果页表项不存在或不包含有效位（PTE_V），说明这不是写时复制相关的 fault，应直接返回错误。
+
+- 一旦确认页表项既有效又带有 `PTE_COW`（即 `(PTE_V | PTE_COW)` 同时满足），并且异常类型为写操作（`CAUSE_STORE_PAGE_FAULT`），说明当前进程试图写入一个被 COW 机制管理的共享页面，这正是 COW 的触发条件：
+
+   ```c
+   if ((*ptep & (PTE_V | PTE_COW)) == (PTE_V | PTE_COW) &&
+      error_code == CAUSE_STORE_PAGE_FAULT)
+   ```
+
+- 进入 COW 分支后，内核通过 `pte2page(*ptep)` 找到实际的物理页，并根据引用计数决定处理方式：
+
+1. **如果 `page_ref(page) > 1`，该页由多个进程共享。**
+   代码中调用 `alloc_page()` 为当前进程分配一个新物理页，然后通过：
+
+   ```c
+   memcpy(page2kva(npage), page2kva(page), PGSIZE);
+   ```
+
+   将旧页内容完整复制到新页。接着重新利用 `page_insert()` 将该新页映射到触发异常的地址，并为它添加写权限（`| PTE_W`）并移除 COW 标记（`& ~PTE_COW`）。这样，只有当前进程获得新的可写页，不会影响其他仍共享旧物理页的进程。
+
+2. **如果 `page_ref(page) == 1`，说明该页已为当前进程独占。**
+   既然没有其他进程依赖这页数据，就无需复制。代码直接修改页表项，恢复写权限并移除 COW 标记：
+
+   ```c
+   *ptep = (*ptep | PTE_W) & ~PTE_COW;
+   tlb_invalidate(mm->pgdir, la);
+   ```
+
+   此时刷新 TLB 是必要的，因为 CPU 可能仍缓存旧的只读+COW 权限。如果不刷新，CPU 会继续误认为该页不可写，从而重复触发错误。
+#### 异常处理
+```c
+case CAUSE_STORE_PAGE_FAULT:
+      if (current != NULL && current->mm != NULL)
+      {
+         int ret = do_pgfault(current->mm, tf->cause, tf->tval);
+         if (ret != 0)
+         {
+               cprintf("Unhandled page fault: va=0x%lx cause=%ld err=%d\n", tf->tval, tf->cause, ret);
+               print_trapframe(tf);
+               do_exit(-E_KILLED);
+         }
+      }
+      else
+      {
+         cprintf("Kernel page fault at va=0x%lx\n", tf->tval);
+         print_trapframe(tf);
+         panic("unhandled kernel page fault");
+      }
+      break;
+```
+1. 判断当前是否有用户进程在运行
+
+   ```c
+   if (current != NULL && current->mm != NULL)
+   ```
+
+* `current`：当前正在运行的进程
+* `current->mm`：进程的内存管理结构（包含页表、VMA 列表等）
+
+   如果两者都存在 → 说明 page fault 发生在用户态进程中，应该交给用户页错误处理逻辑。
+2. 调用 do_pgfault() 处理缺页
+
+   ```c
+   int ret = do_pgfault(current->mm, tf->cause, tf->tval);
+   ```
+
+* `current->mm`：进程的内存空间
+* `tf->cause`：异常原因（这里是 STORE_PAGE_FAULT）
+* `tf->tval`：触发异常的虚拟地址（faulting address）
+
+  这里进行`COW+缺页异常`的处理；
+3. 如果 do_pgfault 返回非 0（表示失败）
+
+```c
+if (ret != 0)
+{
+    cprintf("Unhandled page fault: va=0x%lx cause=%ld err=%d\n",
+            tf->tval, tf->cause, ret);
+    print_trapframe(tf);
+    do_exit(-E_KILLED);
+}
+```
+
+表示这个 page fault 当前内核无法处理。
+1. **打印错误信息**
+2. **打印 trapframe（寄存器状态）排查问题**
+3. **终止当前进程（do_exit(-E_KILLED)）**
+
+也就是说：
+
+> **只要 do_pgfault 无法处理，该进程就被认为访问非法内存 → 直接 kill。**
+
+---
+4. 如果没有 current 或 current->mm,表示 page fault 发生在：
+
+* 内核态 kernel page fault
+* 或者进入 trap 的时候没有有效进程
+
+```c
+else
+{
+    cprintf("Kernel page fault at va=0x%lx\n", tf->tval);
+    print_trapframe(tf);
+    panic("unhandled kernel page fault");
+}
+```
+**这是致命错误**，内核绝不能随便缺页，于是直接 panic。
+### 测试样例
+为了测试COW机制的正确性，我们设计了`cow.c`文件，验证在实现 Copy-on-Write（COW） 机制后，用户进程在 `fork()` 之后共享的只读页是否能够正确触发写时复制过程，从而保证父子进程对同一逻辑地址空间的写入不会互相影响。
+1. 测试功能概述
+
+   程序中定义了一个全局缓冲区：
+
+   ```c
+   static char shared_page[4096] = "ucore-cow";
+   ```
+
+   该数组放在用户进程的 **BSS/数据段** 中，对应着一页可写的用户空间物理页。在调用 `fork()` 后，父子进程应当按照 COW 机制：
+
+   1. **共享同一个物理页**
+   2. **页面权限设置为只读**
+   3. **当其中一个进程写入该页时触发 page fault**
+   4. 操作系统为写入进程分配一个新的物理页，并将原内容复制过去，从而实现写时复制。
+
+   本测试代码正是通过修改该缓冲区内容来检测上述机制是否正确工作。
+2. 测试流程说明
+
+   (1)父进程的初始化输出
+
+   ```c
+   cprintf("[cow] parent before fork: %s\n", shared_page);
+   ```
+
+   父进程首先输出缓冲区初始内容 `"ucore-cow"`，用于后续与子进程修改后的数据作对比。
+
+   ---
+
+   (2)创建子进程：fork()
+
+   ```c
+   int pid = fork();
+   ```
+
+   此时：
+
+   * 父进程与子进程共享同一物理页的数据段页
+   * 内核在 fork() 中应该将该页标记为 **只读 + COW 属性**
+   * 页框引用计数增加（`ref > 1`）
+
+   这是 COW 正常启动的必要前提。
+
+   ---
+
+   (3)子进程的 COW 写入测试
+
+   子进程中执行：
+
+   ```c
+   shared_page[0] = 'C';
+   shared_page[1] = 'H';
+   shared_page[2] = 'I';
+   ```
+
+   该写入操作应当触发：
+
+   1. **写时 page fault**
+   2. do_pgfault 检测到这是 COW 页（ref > 1）
+   3. 内核为子进程分配新物理页
+   4. 将原页内容复制到新页
+   5. 将子进程页表修改为可写
+   6. 页框引用计数恢复正确数值（通常 ref--）
+
+   子进程随后输出修改后的字符串：
+
+   ```c
+   cprintf("[cow] child modified buffer: %s\n", shared_page);
+   ```
+
+   若输出成功，说明子进程确实获得了一个私有的新页。
+
+   ---
+
+   (4)父进程对子进程写入的隔离性验证
+
+   父进程等待子进程退出：
+
+   ```c
+   wait();
+   ```
+
+   此后父进程再次打印其缓冲区内容：
+
+   ```c
+   cprintf("[cow] parent after child exit: %s\n", shared_page);
+   ```
+
+   其预期内容仍应为 `"ucore-cow"`。
+
+   然后父进程进一步判断：
+
+   ```c
+   if (shared_page[0] == 'C') {
+      cprintf("[cow] FAILED: parent saw child's write\n");
+   }
+   ```
+
+   如果父进程看到 `"CHI..."` 开头的字符串，则说明 COW **失效**：父进程与子进程没有被分离。
+
+   若父进程数据未改变，则输出：
+   ```
+   [cow] PASSED: parent buffer intact
+   ```
+   这表明：
+
+   * COW 机制正确触发
+   * 子进程写入不会影响父进程
+   * 内核成功处理写时复制的 page fault
+### 测试结果
+我们执行`make build-cow`和`make qemu`后，在终端中输出调试信息，出现`PASS`信息，说明我们的COW实现正确。
+![alt text](image.png)
+## dirtycow的模拟与解决
+COW状态机（按虚拟页视角）
+1. Private-W: 单独占有、可写（普通映射）。
+2. Fork → Shared-RO-COW: 父/子共享同一物理页，PTE_W被清除、PTE_COW置位，写入会触发fault。
+3. Fault on Shared-RO-COW:
+   - ref>1: 分配新页，复制内容，映射为Private-W；其他进程仍留在Shared-RO-COW。
+   - ref==1: 直接清除PTE_COW、恢复PTE_W，状态变为Private-W（无复制）。
+4. 后续写入在Private-W上不再触发COW。
+
+测试用例
+- 新增用户态程序[user/cow.c](user/cow.c)：父进程在fork前写入缓冲区，子进程写入首字节并退出，父进程检测自身缓冲区是否被污染；成功则输出“PASSED”。该用例覆盖了共享只读、写时复制、父子视图隔离三条路径。
+
+- Dirty COW漏洞核心是利用写入与权限标记之间的竞态反复将页变回可写并绕过复制。在本实现里，写fault只有在PTE_COW存在时才会触发，且do_pgfault在持有页表锁（隐含于当前进程上下文）后要么复制、要么就地升级权限；ref计数>1时必须复制，避免绕过共享保护。这样避免了在标记回写之前的可写窗口。
+- 若要进一步逼近Dirty COW场景，可以让父子进程在同一页上高频并发write，观察是否出现父视图被污染；当前逻辑在ref>1时强制复制，应不会出现污染。若发现污染，可在PTE更新后强制sfence.vma并检查ref计数一致性来缓解。
+
+
+说明
+- 用户程序在链接阶段被拼入内核镜像，由kernel.ld把多个__user_*段按binary形式附加到内核镜像，启动时直接可用，省去了运行时磁盘加载，适合教学环境的小型镜像。
 ## 扩展练习二
 >说明该用户程序是何时被预先加载到内存中的？与我们常用操作系统的加载有何区别，原因是什么？
+## 实验设计的知识点
+## 分支任务

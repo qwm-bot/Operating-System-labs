@@ -37,6 +37,8 @@
 static void check_vmm(void);
 static void check_vma_struct(void);
 
+volatile unsigned int pgfault_num = 0;
+
 // mm_create -  alloc a mm_struct & initialize it.
 struct mm_struct *
 mm_create(void)
@@ -219,6 +221,7 @@ int dup_mmap(struct mm_struct *to, struct mm_struct *from)
         insert_vma_struct(to, nvma);
 
         bool share = 0;
+        // bool share = 1;
         if (copy_range(to->pgdir, from->pgdir, vma->vm_start, vma->vm_end, share) != 0)
         {
             return -E_NO_MEM;
@@ -381,4 +384,59 @@ bool user_mem_check(struct mm_struct *mm, uintptr_t addr, size_t len, bool write
         return 1;
     }
     return KERN_ACCESS(addr, addr + len);
+}
+
+/* Handle user page faults, including copy-on-write resolution. */
+int do_pgfault(struct mm_struct *mm, uint32_t error_code, uintptr_t addr)
+{
+    pgfault_num++;
+
+    if (mm == NULL)
+    {
+        return -E_INVAL;
+    }
+
+    struct vma_struct *vma = find_vma(mm, addr);
+    if (vma == NULL || addr < vma->vm_start)
+    {
+        return -E_INVAL;
+    }
+
+    uintptr_t la = ROUNDDOWN(addr, PGSIZE);
+    pte_t *ptep = get_pte(mm->pgdir, la, 0);
+    if (ptep == NULL)
+    {
+        return -E_NO_MEM;
+    }
+
+    // Only handle write faults on COW-marked present pages
+    if ((*ptep & (PTE_V | PTE_COW)) == (PTE_V | PTE_COW) && error_code == CAUSE_STORE_PAGE_FAULT)
+    {
+        struct Page *page = pte2page(*ptep);
+        if (page_ref(page) > 1)
+        {
+            struct Page *npage = alloc_page();
+            if (npage == NULL)
+            {
+                return -E_NO_MEM;
+            }
+            memcpy(page2kva(npage), page2kva(page), PGSIZE);
+            uint32_t perm = (*ptep & PTE_USER) | PTE_W;
+            perm &= ~PTE_COW;
+            int ret = page_insert(mm->pgdir, npage, la, perm);
+            if (ret != 0)
+            {
+                free_page(npage);
+                return ret;
+            }
+        }
+        else
+        {
+            *ptep = (*ptep | PTE_W) & ~PTE_COW;
+            tlb_invalidate(mm->pgdir, la);
+        }
+        return 0;
+    }
+
+    return -E_INVAL;
 }
