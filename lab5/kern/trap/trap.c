@@ -127,24 +127,41 @@ void interrupt_handler(struct trapframe *tf)
          *(3)当计数器加到100的时候，我们会输出一个`100ticks`表示我们触发了100次时钟中断，同时打印次数（num）加一
          * (4)判断打印次数，当打印次数为10时，调用<sbi.h>中的关机函数关机
          */
-         // (1) 设置下次时钟中断
-        clock_set_next_event();
+
+         /* LAB5 GRADE   YOUR CODE :  */
+        /* 时间片轮转： 
+        *(1) 设置下一次时钟中断（clock_set_next_event）
+        *(2) ticks 计数器自增
+        *(3) 每 TICK_NUM 次中断（如 100 次），进行判断当前是否有进程正在运行，如果有则标记该进程需要被重新调度（current->need_resched）
+        */
+        // clock_set_next_event();
         
-        // (2) 计数器加一
-        ticks++;
+        // // (2) 计数器加一
+        // ticks++;
         
-        // (3) 每100次时钟中断输出一次
-        if (ticks % TICK_NUM == 0) {
-            print_ticks();  // 输出"100 ticks"
-            num++;          // 打印次数加一
+        // // (3) 每100次时钟中断输出一次
+        // if (ticks % TICK_NUM == 0) {
+        //     print_ticks();  // 输出"100 ticks"
+        //     num++;          // 打印次数加一
             
-            // (4) 打印10次后关机
-            if (num == 10) {
-                cprintf("Reached 10 times, shutting down...\n");
-                sbi_shutdown();  // 调用关机函数
-            }
+        //     // (4) 打印10次后关机
+        //     if (num == 10) {
+        //         cprintf("Reached 10 times, shutting down...\n");
+        //         sbi_shutdown();  // 调用关机函数
+        //     }
+        // }
+        // current->need_resched = 1;//change
+        clock_set_next_event();
+
+        // (2) ticks 计数器自增
+        ticks++;
+
+        // (3) 每 TICK_NUM 次中断（如 100 次），进行判断当前是否有进程正在运行，
+        // 如果有则标记该进程需要被重新调度（current->need_resched）
+        if (ticks % TICK_NUM == 0) {
+            assert(current != NULL);
+            current->need_resched = 1;
         }
-        current->need_resched = 1;//change
         break;
     case IRQ_H_TIMER:
         cprintf("Hypervisor software interrupt\n");
