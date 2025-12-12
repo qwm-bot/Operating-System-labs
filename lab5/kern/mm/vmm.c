@@ -220,8 +220,7 @@ int dup_mmap(struct mm_struct *to, struct mm_struct *from)
 
         insert_vma_struct(to, nvma);
 
-        bool share = 0;
-        // bool share = 1;
+        bool share = 1;
         if (copy_range(to->pgdir, from->pgdir, vma->vm_start, vma->vm_end, share) != 0)
         {
             return -E_NO_MEM;
@@ -386,11 +385,10 @@ bool user_mem_check(struct mm_struct *mm, uintptr_t addr, size_t len, bool write
     return KERN_ACCESS(addr, addr + len);
 }
 
-/* Handle user page faults, including copy-on-write resolution. */
-int do_pgfault(struct mm_struct *mm, uint32_t error_code, uintptr_t addr)
+// Handle user page faults, including copy-on-write resolution. 
+ int do_pgfault(struct mm_struct *mm, uint32_t error_code, uintptr_t addr)
 {
     pgfault_num++;
-
     if (mm == NULL)
     {
         return -E_INVAL;
@@ -429,6 +427,11 @@ int do_pgfault(struct mm_struct *mm, uint32_t error_code, uintptr_t addr)
                 free_page(npage);
                 return ret;
             }
+            /*
+            // 模拟Dirty COW：换回指向原始页面，使其可写
+            *ptep = pte_create(page2ppn(page), PTE_V | perm);
+            tlb_invalidate(mm->pgdir, la);
+            free_page(npage); // 释放未使用的npage*/
         }
         else
         {
@@ -439,4 +442,4 @@ int do_pgfault(struct mm_struct *mm, uint32_t error_code, uintptr_t addr)
     }
 
     return -E_INVAL;
-}
+} 

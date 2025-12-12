@@ -1,6 +1,97 @@
 # LAB5——用户程序
 ## 练习0：填写已有实验
 >本实验依赖实验2/3/4。请把你做的实验2/3/4的代码填入本实验中代码中有“LAB2”/“LAB3”/“LAB4”的注释相应部分。注意：为了能够正确执行lab5的测试应用程序，可能需对已完成的实验2/3/4的代码进行进一步改进。
+### 更新`alloc_page()`函数
+```c
+static struct proc_struct *
+alloc_proc(void)
+{
+    struct proc_struct *proc = kmalloc(sizeof(struct proc_struct));
+    if (proc != NULL)
+    {
+        proc->state = PROC_UNINIT;          // 进程状态：未初始化
+        proc->pid = -1;                      // 进程ID：未分配
+        proc->runs = 0;                      // 运行次数：0
+        proc->kstack = 0;                     // 内核栈地址：未分配
+        proc->need_resched = 0;              // 不需要重新调度
+        proc->parent = NULL;                  // 父进程指针：无
+        proc->mm = NULL;                      // 内存管理结构：内核线程不需要
+        memset(&(proc->context), 0, sizeof(struct context)); // 上下文清零
+        proc->tf = NULL;                      // 陷阱帧指针：未设置
+        proc->pgdir = boot_pgdir_pa;                  // 页目录基址：未分配//change!!!
+        proc->flags = 0;                      // 进程标志：0
+        memset(proc->name, 0, PROC_NAME_LEN + 1); // 进程名清零
+
+        // LAB5 YOUR CODE : (update LAB4 steps)
+        proc->wait_state = 0;  //当前进程不在任何等待状态
+        proc->cptr = NULL;     //当前进程还没有子进程
+        proc->optr = NULL;     //当前进程还没有更年轻的子进程
+        proc->yptr = NULL;     //当前进程还没有更年长的兄弟进程
+    }
+    return proc;
+}
+```
+在已有的函数上，添加`wait_state`，`*cptr`，`*yptr`，`*optr`的初始化操作，代码如上所示。
+### 更新`do_fork()`函数
+```c
+int do_fork(uint32_t clone_flags, uintptr_t stack, struct trapframe *tf)
+{
+    int ret = -E_NO_FREE_PROC;
+    struct proc_struct *proc;
+    if (nr_process >= MAX_PROCESS)
+    {
+        goto fork_out;
+    }
+    ret = -E_NO_MEM;
+    proc = alloc_proc();
+    if (proc == NULL) {
+        goto fork_out;
+    }
+    proc->parent = current;
+    assert(current->wait_state==0);
+    if (setup_kstack(proc) != 0) {
+        goto bad_fork_cleanup_proc;
+    }
+    if (copy_mm(clone_flags, proc) != 0) {
+        goto bad_fork_cleanup_kstack;
+    }
+    
+    proc->pid = get_pid();
+    copy_thread(proc, stack, tf);
+
+    hash_proc(proc);
+    set_links(proc);
+    wakeup_proc(proc);
+
+    ret = proc->pid;
+    
+    // LAB5 YOUR CODE : (update LAB4 steps)
+    // TIPS: you should modify your written code in lab4(step1 and step5), not add more code.
+    /* Some Functions
+     *    set_links:  set the relation links of process.  ALSO SEE: remove_links:  lean the relation links of process
+     *    -------------------
+     *    update step 1: set child proc's parent to current process, make sure current process's wait_state is 0
+     *    update step 5: insert proc_struct into hash_list && proc_list, set the relation links of process
+     */
+
+fork_out:
+    return ret;
+
+bad_fork_cleanup_kstack:
+    put_kstack(proc);
+bad_fork_cleanup_proc:
+    kfree(proc);
+    goto fork_out;
+}
+
+```
+在 `do_fork` 中，更新对新创建进程 `proc` 的 **状态和父子关系信息进行初始化和关联** 的操作，主要包括：
+
+1. **设置父进程指针**：将 `proc->parent` 指向当前进程，保证新进程知道自己的父进程是谁。
+2. **检查父进程状态**：通过 `assert(current->wait_state == 0)` 确保父进程在 fork 时未处于等待状态，从而避免进程调度冲突。
+3. **插入全局数据结构**：将新进程加入哈希表（用于 PID 查找）和全局进程链表（用于系统遍历所有进程）。
+4. **建立父子链表关系**：调用 `set_links(proc)`，将新进程插入父进程的子进程链表，并维护兄弟进程的指针（`cptr/yptr/optr`），保证父子关系链完整。
+
 ## 练习一：加载应用程序并执行（需要编码）
 >**`do_execve`**函数调用`load_icode`（位于kern/process/proc.c中）来加载并解析一个处于内存中的ELF执行文件格式的应用程序。你需要补充`load_icode`的第6步，设置好`proc_struct`结构中的成员变量`trapframe`的内容，确保在执行此进程后，能够从应用程序设定的起始执行地址开始执行。需设置正确的trapframe内容。
 >
@@ -628,23 +719,44 @@ else
 我们执行`make build-cow`和`make qemu`后，在终端中输出调试信息，出现`PASS`信息，说明我们的COW实现正确。
 ![alt text](image.png)
 ## dirtycow的模拟与解决
-COW状态机（按虚拟页视角）
-1. Private-W: 单独占有、可写（普通映射）。
-2. Fork → Shared-RO-COW: 父/子共享同一物理页，PTE_W被清除、PTE_COW置位，写入会触发fault。
-3. Fault on Shared-RO-COW:
-   - ref>1: 分配新页，复制内容，映射为Private-W；其他进程仍留在Shared-RO-COW。
-   - ref==1: 直接清除PTE_COW、恢复PTE_W，状态变为Private-W（无复制）。
-4. 后续写入在Private-W上不再触发COW。
+![alt text](image-1.png)
 
-测试用例
-- 新增用户态程序[user/cow.c](user/cow.c)：父进程在fork前写入缓冲区，子进程写入首字节并退出，父进程检测自身缓冲区是否被污染；成功则输出“PASSED”。该用例覆盖了共享只读、写时复制、父子视图隔离三条路径。
+Dirty COW是 Linux 内核中一个典型的“写时复制（Copy-On-Write, COW）竞态漏洞”。该漏洞的核心在于：攻击者能够在内核完成 COW 操作之前，通过竞争条件让本应只读的共享物理页被错误地写入，从而实现对只读文件或父进程内存内容的修改。
 
-- Dirty COW漏洞核心是利用写入与权限标记之间的竞态反复将页变回可写并绕过复制。在本实现里，写fault只有在PTE_COW存在时才会触发，且do_pgfault在持有页表锁（隐含于当前进程上下文）后要么复制、要么就地升级权限；ref计数>1时必须复制，避免绕过共享保护。这样避免了在标记回写之前的可写窗口。
-- 若要进一步逼近Dirty COW场景，可以让父子进程在同一页上高频并发write，观察是否出现父视图被污染；当前逻辑在ref>1时强制复制，应不会出现污染。若发现污染，可在PTE更新后强制sfence.vma并检查ref计数一致性来缓解。
+组合使用mmap和madvise就可以利用写时复制的竞态条件漏洞，这张图展示了整个过程。
 
+先看右边的图，这是一个进程将只读文件映射到进程的虚拟内存地址中，当mmap指定参数为map_private，尽管是只读的，仍然可以写入数据，只不过这时写到的是原始物理内存的副本。
 
-说明
-- 用户程序在链接阶段被拼入内核镜像，由kernel.ld把多个__user_*段按binary形式附加到内核镜像，启动时直接可用，省去了运行时磁盘加载，适合教学环境的小型镜像。
+左边的图，步骤A，B，C，是写时复制的三个步骤，首先创建映射内存的副本，然后将进程页表指向原始物理内存的副本，最后向副本写入数据。
+
+那么当同一个进程的线程1执行写时复制过程，具体的就是执行完步骤B但还没执行步骤C，另一个线程2调用了madvice()，那么进程的页表将重新指向原始的映射的内存物理块，线程1继续执行步骤C会向只读文件写入数据。
+
+这就是整个Dirty-cow漏洞的利用过程。[参考博客](https://blog.csdn.net/hbhgyu/article/details/106245182)
+>int madvise(void *addr, size_t length, int addvice)
+>
+>madvise():向内核提供有关从addr到addr+length的内存的建议或指示
+>
+>advice (3rd参数):MADV_DONOTNEED:告知内核不再需要声明地址部分的内存。内核将释放声称地址的资源,进程的页表将指向原始物理内存。
+
+从我们的代码实现上来讲，当`madvise()`执行完成时，已经执行完了`do_pgfault`,此时父进程对应的物理页的`page_ref==1`,当子进程继续执行stepC时，会在父进程的物理页上进行写操作，此时根据代码，父进程的物理页会自动升级为可写物理页，最终导致子进程修改了父进程物理页的数据。
+### dirtycow的模拟
+由于 Dirty COW 漏洞依赖于 Linux 内核中多个复杂组件（如 `madvise(MADV_DONTNEED)`、`get_user_pages()`、文件映射页缓存、异步页表更新、多线程竞争等）的并发交互，而 uCore 作为教学用操作系统，缺乏这些系统调用和整体机制：其内存管理路径简单、无文件映射层、无 page cache、页表更新集中并且无多核并发，也不存在内核长期 pin 住用户页的逻辑。因此，触发 Dirty COW 所需的关键竞态根本无法在 uCore 中构造，uCore 的 COW 机制也不会出现 Linux 中“写文件映射页导致原始文件内容被修改”的安全风险。故 Dirty COW 在 uCore 中无法被完全复现。但我们可以大致模拟一下这个过程：
+
+我们在`do_pgfault`函数的实现中，在子进程更新页表后，重新让子进程PTE重新指回旧物理页，来模拟另一个进程的`madvise`函数的效果。
+```c
+// 模拟Dirty COW：换回指向原始页面，使其可写
+*ptep = pte_create(page2ppn(page), PTE_V | perm);
+tlb_invalidate(mm->pgdir, la);
+free_page(npage); // 释放未使用的npage
+```
+我们再次测试`cow.c`,发现父进程的字符串也变成了`CHIre-cow`,这样我们就模拟了dirtycow的效果。
+
+![alt text](image-2.png)
+
+在开始的uCore中的COW的实现中，其实是不会出现`dirtycow`的情况的：目前的进程的调度并不是时间片轮转的方式，没有实现真正意义上的多线程并发，在进行cow的时候不会出现进程的调度，也没有实现`madvise`函数，所以目前stepA,B,C是严格原子性的，所以不会出现`dirtycow`。
+
+但是在真实的应用系统中，为修复该漏洞，内核必须将 COW 的关键步骤“检查 → 分配新页 → 复制内容 → 安装新页表”变成一个原子化、不可被抢占的过程。在真实的Linux 的补丁中，主要通过禁止中途的页表权限降级、序列号校验（MMU notifier）、写保护引用计数加固，以及在 COW 整个流程中使用锁定与内存屏障来确保不会再出现能够让页表状态回退的竞态条件。简言之，修复方法就是：让任何导致旧页被写入的并发途径都无法在 COW 关键路径中穿插执行，从而消除 Dirty COW 的竞态窗口。
+
 ## 扩展练习二
 >说明该用户程序是何时被预先加载到内存中的？与我们常用操作系统的加载有何区别，原因是什么？
 ## 实验设计的知识点
