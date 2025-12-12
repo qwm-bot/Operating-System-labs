@@ -31,10 +31,10 @@ DTB init completed
 
 Special kernel symbols:
   entry  0xc020004a (virtual)
-  etext  0xc0205a80 (virtual)
-  edata  0xc02a1c78 (virtual)
-  end    0xc02a6128 (virtual)
-Kernel executable memory footprint: 665KB
+  etext  0xc0205964 (virtual)
+  edata  0xc02b1bd0 (virtual)
+  end    0xc02b6084 (virtual)
+Kernel executable memory footprint: 729KB
 memory management: default_pmm_manager
 physcial memory map:
   memory: 0x08000000, [0x80000000, 0x87ffffff].
@@ -49,7 +49,7 @@ check_vmm() succeeded.
 ++ setup timer interrupts
 kernel_execve: pid = 2, name = "divzero".
 Breakpoint
-value is 0.
+value is -1.
 user panic at user/divzero.c:9:
     FAIL: T.T
 

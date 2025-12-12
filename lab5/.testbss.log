@@ -31,10 +31,10 @@ DTB init completed
 
 Special kernel symbols:
   entry  0xc020004a (virtual)
-  etext  0xc0205a80 (virtual)
-  edata  0xc02a1c78 (virtual)
-  end    0xc02a6128 (virtual)
-Kernel executable memory footprint: 665KB
+  etext  0xc0205964 (virtual)
+  edata  0xc02b1bd0 (virtual)
+  end    0xc02b6084 (virtual)
+Kernel executable memory footprint: 729KB
 memory management: default_pmm_manager
 physcial memory map:
   memory: 0x08000000, [0x80000000, 0x87ffffff].
@@ -53,23 +53,23 @@ Making sure bss works right...
 Yes, good.  Now doing a wild write off the end...
 testbss may pass.
 Unhandled page fault: va=0xc02000 cause=15 err=-3
-trapframe at 0xffffffffc04acee0
+trapframe at 0xffffffffc04bcee0
   zero     0x00000000
-  ra       0x008005c6
+  ra       0x008005ea
   sp       0x7fffffe0
   gp       0x00000000
   tp       0x00000000
   t0       0x00000000
-  t1       0x7ffffed0
+  t1       0x7fffffa8
   t2       0x00000000
   s0       0x00000000
   s1       0x00000000
   a0       0x00000000
-  a1       0x7fffff84
-  a2       0x008007c0
+  a1       0x0000000a
+  a2       0x00800a00
   a3       0x7fffffa8
   a4       0x00100000
-  a5       0x00c025c8
+  a5       0x00c025ec
   a6       0x00000000
   a7       0x00000000
   s2       0x00000000
@@ -82,12 +82,12 @@ trapframe at 0xffffffffc04acee0
   s9       0x00000000
   s10      0x00000000
   s11      0x00000000
-  t3       0x00000000
+  t3       0x00800a00
   t4       0x00000000
   t5       0x00000000
   t6       0x00000000
   status   0x00046020
-  epc      0x008005cc
+  epc      0x008005f0
   tval 0x00c02000
   cause    0x0000000f
 all user-mode processes have quit.
