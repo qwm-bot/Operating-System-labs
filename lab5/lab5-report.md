@@ -223,12 +223,123 @@ do {
             assert(ret == 0);
         }
 ```
+### Copy on Write (COW) 详细设计思路
 
------
+#### 1\. 核心思想：推迟复制，按需分配
+
+在标准的 `fork()` 操作中，父进程的整个用户空间内存会被“深拷贝”给子进程。如果父进程占用了大量内存，这个操作将非常耗时且浪费内存（特别是当子进程立刻调用 `exec` 替换整个内存空间时）。
+
+COW 机制的核心策略是：**Don't copy until you have to.**
+
+  * **Fork 时**：不复制物理内存，只复制页表项（PTE）。父子进程共享同一块物理内存，但将双方的页表权限都设为**只读（Read-Only）**。
+  * **Write 时**：当任一进程尝试写入共享页时，CPU 触发缺页异常（Page Fault）。内核捕获异常后，检查发现这是一个 COW 页，此时才分配新的物理页，复制数据，并将权限恢复为**可写（Read/Write）**。
+
+#### 2\. 关键技术细节
+
+为了在 uCore 中实现 COW，我们需要利用 RISC-V 页表项（PTE）的保留位和物理页的引用计数机制。
+
+##### 2.1 标记位的选择 (`PTE_COW`)
+
+RISC-V 的 PTE 结构中，低 10 位包含权限和状态标志。其中第 8 位和第 9 位是 **RSW (Reserved for Supervisor Software)**，硬件会忽略它们，留给操作系统内核自定义使用。
+
+我们选用其中一位（例如第 8 位）作为 `PTE_COW` 标记：
+
+  * **PTE\_COW (0x100)**: 表示该页面当前处于 Copy-on-Write 状态。
+
+##### 2.2 物理页引用计数 (`page_ref`)
+
+uCore 的物理内存管理（`pmm.c`）中，每个物理页对应一个 `struct Page` 结构，其中包含 `ref` 变量记录该页被引用的次数。
+
+  * **ref = 1**：页面被一个进程独占，可以随意读写。
+  * **ref \> 1**：页面被多个进程（父子进程）共享，必须是只读的。
+
+#### 3\. 详细处理流程
+
+我们将 COW 的生命周期分为三个阶段：**设置阶段 (Fork)**、**触发阶段 (Write Trap)** 和 **处理阶段 (Page Fault Handler)**。
+
+##### 阶段一：设置共享 (Fork -\> `copy_range`)
+
+在 `do_fork` 调用 `copy_range` 复制内存映射时，对于每一页：
+
+1.  **检查权限**：如果该页原本是**可写**的 (`PTE_W`)，则它是 COW 的候选者（只读页本来就不能写，直接共享即可，不需要 COW）。
+2.  **修改父进程 PTE**：
+      * **禁用写权限**：清除 `PTE_W` 位。这是为了让 CPU 在父进程写入时触发异常。
+      * **启用 COW 标记**：设置 `PTE_COW` 位。这是为了告诉异常处理程序：“这不是一个普通的只读页，而是一个等待复制的 COW 页”。
+      * **刷新 TLB**：`tlb_invalidate`，强制 CPU 重新加载修改后的 PTE。
+3.  **建立子进程映射**：
+      * 使用 `page_insert` 将**同一个物理页**映射到子进程的虚拟地址。
+      * 构造子进程的权限：同样是 `PTE_USER | PTE_R | PTE_COW`（无 `PTE_W`）。
+      * **关键点**：`page_insert` 内部会自动将该物理页的引用计数 `ref` 加 1。此时，该物理页的 `ref` 至少为 2。
+
+##### 阶段二：触发异常 (硬件行为)
+
+当父进程或子进程尝试执行写指令（如 `sw`）时：
+
+1.  MMU 查找页表，发现 PTE 中没有 `PTE_W` 权限。
+2.  MMU 拒绝写入，触发 **Store Page Fault** 异常。
+3.  CPU 跳转到 `trap.c`，最终进入 `do_pgfault` 函数。
+
+##### 阶段三：处理异常 (`do_pgfault`)
+
+这是 COW 逻辑最复杂的地方。`do_pgfault` 需要区分“真的非法写入”和“合法的 COW 写入”。
+
+1.  **合法性检查**：
+
+      * PTE 是否存在且有效 (`PTE_V`)？
+      * PTE 是否包含 `PTE_COW` 标记？
+      * 异常原因是否是写操作 (`CAUSE_STORE_PAGE_FAULT`)？
+      * 如果都满足，说明这是 COW 触发的缺页，进入 COW 处理逻辑；否则按普通缺页或非法访问处理。
+
+2.  **获取物理页信息**：通过 PTE 找到对应的 `struct Page`。
+
+3.  **分支处理**：
+
+      * **情况 A：共享中 (ref \> 1)**
+          * 这意味着还有其他进程在使用该页。当前进程必须把数据拷贝出去，不能影响别人。
+          * **Action**：
+            1.  `alloc_page()` 分配一个新的物理页。
+            2.  `memcpy()` 将旧页面的内容完整复制到新页。
+            3.  构造新权限：`PTE_USER | PTE_R | PTE_W`（**恢复写权限，去掉 COW 标记**）。
+            4.  `page_insert()` 将新页映射到当前进程的地址。
+            5.  **注意**：`page_insert` 会自动处理旧页面的引用计数。它发现该虚拟地址已经有映射了，会先解除旧映射（使旧页 `ref--`），再建立新映射。
+      * **情况 B：独占中 (ref == 1)**
+          * 这意味着其他共享该页的进程都已经退出了，或者都已经发生了 COW 拷贝并拥有了自己的新页。当前进程是该物理页的唯一拥有者。
+          * **Action**：不需要复制！直接“原低升级”。
+            1.  修改当前 PTE：加上 `PTE_W`，去掉 `PTE_COW`。
+            2.  `tlb_invalidate()` 刷新 TLB。
+
+#### 4\. 状态转换图 (Finite State Machine)
+
+```mermaid
+stateDiagram-v2
+    [*] --> PrivateW : alloc_page
+    
+    state "Private-W\n(Ref=1, W=1, COW=0)" as PrivateW
+    state "Shared-RO\n(Ref>1, W=0, COW=1)" as SharedRO
+    
+    PrivateW --> SharedRO : fork() \n[父子进程PTE: -W, +COW, Ref++]
+    
+    SharedRO --> PrivateW : Write Fault (Ref==1) \n[PTE: +W, -COW]
+    
+    SharedRO --> PrivateW : Write Fault (Ref>1) \n[Alloc New Page, Copy, Ref--]
+    
+    SharedRO --> SharedRO : Read Access \n[No Fault]
+```
+
+#### 5\. 边界情况与设计细节
+
+  * **只读页面的处理**：如果原页面本身就是只读的（比如代码段），在 `fork` 时不应该设置 `PTE_COW`，也不应该去掉 `PTE_W`（因为它本来就没有）。这些页面应该保持普通的只读共享，引用计数增加即可。写这些页面会触发普通的 Access Fault，而不是 COW 逻辑。
+  * **多级 fork**：进程 A `fork` B，B 又 `fork` C。
+      * A -\> B：物理页 Ref=2，PTE 均为 COW。
+      * B -\> C：`copy_range` 发现 B 的页面已经是只读+COW 了。此时只需简单地将 C 也映射到该物理页，Ref=3，C 的 PTE 也是 COW。
+      * 机制完美支持无限级 fork。
+  * **内存泄漏防护**：`page_insert` 在覆盖映射时必须正确减少旧页面的引用计数，否则物理内存永远不会回收。uCore 的现有实现已经覆盖了这一点。
+
+通过以上设计，COW 机制能够在保证正确性的前提下，最大程度地复用物理内存，显著提升进程创建效率。
 
 ### 2\. COW 机制的设计与 `do_pgfault` 实现
 
-Copy on Write 的设计不仅仅在于 fork 时的设置，更依赖于发生写入异常时的处理。我们通过修改 `do_pgfault` 来实现这一闭环：
+Copy on Write不仅仅在于 fork 时的设置，更依赖于发生写入异常时的处理。我们通过修改 `do_pgfault` 来实现这一闭环：
 
 **异常捕获与识别**
 当用户程序尝试写入一个被标记为“只读+COW”的页面时，CPU 触发 `CAUSE_STORE_PAGE_FAULT`。`do_pgfault` 会捕获此异常并检查：
