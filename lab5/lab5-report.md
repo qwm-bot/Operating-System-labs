@@ -139,6 +139,141 @@ bad_fork_cleanup_proc:
 >请在实验报告中简要说明你的设计实现过程。
 >
 > - 如何设计实现`Copy on Write`机制？给出概要设计，鼓励给出详细设计。
+> - 
+### 1\. 设计实现过程
+
+`copy_range` 函数是进程创建（fork）过程中内存复制的核心，其主要任务是将父进程（`from`）的一段虚拟内存空间（`start` 到 `end`）复制给子进程（`to`）。为了支持写时复制（COW）和标准的内存复制，具体的代码实现逻辑如下：
+
+**第一步：遍历并检查父进程的页表项**
+代码通过一个 `do...while` 循环以 `PGSIZE`（页大小）为步长遍历指定范围的虚拟地址。
+
+```c
+do {
+    // 获取父进程当前地址 start 对应的页表项 (PTE)
+    pte_t *ptep = get_pte(from, start, 0), *nptep;
+    if (ptep == NULL) {
+        // 如果父进程该地址没有映射（PTE不存在），跳过整个页表项覆盖的范围
+        start = ROUNDDOWN(start + PTSIZE, PTSIZE);
+        continue;
+    }
+    // ...
+```
+
+这里使用 `get_pte` 检查父进程在 `start` 地址是否有有效的映射。如果没有，说明这块内存是空的，直接跳过。
+
+**第二步：准备子进程的页表项**
+如果父进程的页表项存在且有效（`PTE_V`），则需要为子进程在同样的虚拟地址获取（或分配）一个页表项。
+
+```c
+    if (*ptep & PTE_V) {
+        // 为子进程获取对应地址的 PTE，如果页表不存在则创建（第三个参数为1）
+        if ((nptep = get_pte(to, start, 1)) == NULL) {
+            return -E_NO_MEM; // 内存不足
+        }
+        uint32_t perm = (*ptep & PTE_USER); // 获取用户态权限
+        struct Page *page = pte2page(*ptep); // 获取父进程对应的物理页结构
+        assert(page != NULL);
+        // ...
+```
+
+**第三步：写时复制（COW）的分支处理（核心逻辑）**
+根据 `share` 参数（由 `do_fork` 传递，fork 时通常为 1）判断是否开启共享。
+
+```c
+        // Case 1: COW 模式 (share == 1)
+        if (share) {
+            // 只有可写的页面才需要 COW 处理
+            if (perm & PTE_W) {
+                // 1. 修改子进程权限：移除写权限 (PTE_W)，添加 COW 标记 (PTE_COW)
+                perm = (perm | PTE_COW) & ~PTE_W; 
+                
+                // 2. 修改父进程权限：移除写权限 (PTE_W)，添加 COW 标记 (PTE_COW)
+                *ptep = (*ptep & ~PTE_W) | PTE_COW; 
+                
+                // 3. 刷新父进程的 TLB，确保硬件感知权限变化（变为只读）
+                tlb_invalidate(from, start);
+            }
+            // 4. 建立映射：将子进程的虚拟地址映射到**同一个物理页 (page)**
+            // 注意：这里没有 alloc_page，实现了内存共享
+            int ret = page_insert(to, page, start, perm);
+            if (ret != 0) return ret;
+        }
+```
+
+**代码解析**：这是实现 COW 的关键。
+
+  * 我们并不复制物理内存，而是直接利用 `page_insert` 把父进程的物理页映射给子进程。
+  * 为了防止父子进程修改数据相互干扰，必须把双方的 `PTE_W`（写权限）都去掉，并打上 `PTE_COW`（软件定义的位），这样任何一方尝试写入都会触发 Page Fault，从而进入 COW 的缺页处理流程。
+
+**第四步：非共享模式（深拷贝）的处理**
+如果 `share` 为 0（例如 `clone` 某些特殊场景），则执行标准的深拷贝。
+
+```c
+        // Case 2: 普通复制模式 (share == 0)
+        else {
+            struct Page *npage = alloc_page(); // 1. 为子进程分配新的物理页
+            assert(npage != NULL);
+            
+            void *src = page2kva(page);    // 父进程页面的内核虚拟地址
+            void *dst = page2kva(npage);   // 子进程新页面的内核虚拟地址
+            memcpy(dst, src, PGSIZE);      // 2. 复制物理内存内容
+
+            // 3. 建立映射：子进程映射到自己的新物理页
+            int ret = page_insert(to, npage, start, perm);
+            assert(ret == 0);
+        }
+```
+
+-----
+
+### 2\. COW 机制的设计与 `do_pgfault` 实现
+
+Copy on Write 的设计不仅仅在于 fork 时的设置，更依赖于发生写入异常时的处理。我们通过修改 `do_pgfault` 来实现这一闭环：
+
+**异常捕获与识别**
+当用户程序尝试写入一个被标记为“只读+COW”的页面时，CPU 触发 `CAUSE_STORE_PAGE_FAULT`。`do_pgfault` 会捕获此异常并检查：
+
+```c
+    // 检查条件：页表项有效 + 包含 COW 标记 + 异常原因是“写”操作
+    if ((*ptep & (PTE_V | PTE_COW)) == (PTE_V | PTE_COW) && error_code == CAUSE_STORE_PAGE_FAULT) {
+        struct Page *page = pte2page(*ptep);
+        // ...
+```
+
+**共享解除（复制/恢复权限）**
+根据物理页的引用计数（`page_ref`）决定如何处理：
+
+1.  **多进程共享中（ref \> 1）**：
+    说明还有其他进程（如父进程）也在用这个页。当前进程需要“私有化”一份副本。
+
+    ```c
+        if (page_ref(page) > 1) {
+            struct Page *npage = alloc_page(); // 分配新页
+            // ... 错误检查 ...
+            memcpy(page2kva(npage), page2kva(page), PGSIZE); // 复制内容
+            
+            // 设置新权限：恢复写权限 (PTE_W)，移除 COW 标记
+            uint32_t perm = (*ptep & PTE_USER) | PTE_W;
+            perm &= ~PTE_COW;
+            
+            // 更新页表，映射到新分配的页
+            page_insert(mm->pgdir, npage, la, perm); 
+        }
+    ```
+
+2.  **独占使用中（ref == 1）**：
+    说明其他进程已经释放了该页（或已发生 COW 拷贝），当前进程是唯一使用者。此时无需复制，直接恢复写权限即可。
+
+    ```c
+        else {
+            // 直接修改当前 PTE：加上写权限，去掉 COW 标记
+            *ptep = (*ptep | PTE_W) & ~PTE_COW;
+            // 必须刷新 TLB
+            tlb_invalidate(mm->pgdir, la);
+        }
+    ```
+
+通过上述 `copy_range` 的设置和 `do_pgfault` 的处理，我们完整实现了 uCore 的写时复制机制。
 ## 练习三：阅读分析源代码，理解进程执行 fork/exec/wait/exit 的实现，以及系统调用的实现（不需要编码）
 > 请在实验报告中简要说明你对 fork/exec/wait/exit函数的分析。并回答如下问题：
 >
