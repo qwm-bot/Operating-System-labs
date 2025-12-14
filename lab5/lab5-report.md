@@ -1375,3 +1375,232 @@ helper_le_stq_mmu (
 >2. 单步调试页表翻译的部分，解释一下关键的操作流程。
 
 页表翻译部分是虚拟地址翻译成物理地址的关键部分，我们在**1**小节中的**页表翻译——读取页表项值**和**页表翻译——得到物理地址**中已经进行了详细的介绍。
+
+### lab5
+
+在本分支任务中，通过 双重 GDB 调试，从模拟器实现层面观察 `ecall` / `sret` 指令在 QEMU 中的处理过程，以加深对系统调用与特权切换机制的理解。
+
+---
+
+#### 一、启动 QEMU 并附加 Host GDB
+
+在 **终端一** 启动 QEMU 调试模式：
+
+```bash
+make debug
+```
+
+在 **终端二** 查询 QEMU 进程号：
+
+```bash
+pgrep -f qemu-system-riscv64
+```
+
+得到 QEMU 的 PID 后，进入 gdb 并附加到该进程：
+
+```bash
+sudo gdb
+(gdb) attach <PID>
+```
+
+此时该 GDB 用于调试 **QEMU 模拟器本身（Host 侧）**。
+
+
+#### 二、用户态到内核态的切换（ecall）
+**1. 在 Guest GDB 中执行到 ecall 前** 
+
+在 Guest GDB 中加载用户程序符号并设置断点：
+
+```gdb
+(gdb) add-symbol-file obj/__user_exit.out
+(gdb) break user/libs/syscall.c:18
+(gdb) continue
+```
+
+执行到断点后，单步执行直到 `ecall` 指令之前：
+
+```gdb
+(gdb) si
+```
+
+查看当前 PC：
+
+```gdb
+(gdb) i r $pc
+pc             0x800104 0x800104 <syscall+44>
+```
+
+此时可以确认 CPU 仍处于 **用户态（U-mode）**，即将执行 `ecall` 指令。
+
+
+**2. 在 QEMU GDB 中捕获 ecall 的翻译**
+
+切换到 **QEMU GDB 窗口**，按下 `Ctrl+C` 中断 QEMU 执行，
+设置断点以拦截 RISC-V 指令的翻译过程：
+
+```gdb
+(gdb) break riscv_tr_translate_insn
+```
+
+继续执行 QEMU：
+
+```gdb
+(gdb) continue
+```
+
+当 Guest 执行 `ecall` 时，QEMU GDB 将命中断点并停在
+`riscv_tr_translate_insn` 函数中。
+
+**3. ecall 执行后的行为观察**
+
+在 Guest GDB 中单步执行 `ecall`：
+
+```gdb
+si
+```
+
+可以直接观察到 PC 跳转至内核地址空间：
+
+```text
+0xffffffffc0200ecc in __alltraps ()
+```
+
+对应 `kern/trap/trapentry.S` 中的：
+
+```asm
+__alltraps:
+    SAVE_ALL
+```
+
+说明CPU 特权级从 U-mode 切换到 S-mode，跳转目标由 `stvec` 决定。
+
+#### 三、sret 指令返回用户态的调试分析
+
+在内核态执行系统调用处理完成后，于
+`kern/trap/trapentry.S` 中设置断点并继续执行：
+
+```gdb
+(gdb) break lab5/kern/trap/trapentry.S:133
+(gdb) c
+```
+
+程序在 `__trapret` 处命中断点：
+
+```text
+Breakpoint 2, __trapret ()
+133         sret
+```
+
+查看当前指令：
+
+```asm
+0xffffffffc0200f8e <__trapret+86>:
+    sret
+```
+
+此时 CPU 仍处于 **S-mode（内核态）**，并即将执行 `sret` 指令。
+`sret` 是 RISC-V 特权架构中用于 **从 S-mode 返回到 U-mode** 的指令，
+其语义包括：
+
+- `pc ← sepc`
+- 根据 `sstatus` 恢复特权级
+- 返回到触发异常的下一条指令
+
+
+在 GDB 中对 `sret` 单步执行：
+
+```gdb
+(gdb) si
+```
+
+PC 立即跳转回用户态代码：
+
+```text
+0x0000000000800108 in syscall ()
+```
+
+对应的用户态指令为：
+
+```asm
+0x800108 <syscall+48>:
+    sd  a0,28(sp)
+```
+
+可以确认返回地址正是 `ecall` 的下一条指令，CPU 特权级已从 S-mode 切换回 U-mode，系统调用返回值已通过寄存器 `a0` 带回用户态
+
+#### 指令翻译（TCG）
+
+在 TCG 翻译阶段，Guest 指令会被翻译为 Host 指令，并存入 Translation Block（TB）中。
+
+每一个 TB 通常包含一段顺序执行的 Guest 指令，单一的入口点，一个明确的退出点。TB 结束后，QEMU 会重新进行指令翻译或跳转到已缓存的 TB。
+
+
+- 当 QEMU 在翻译阶段遇到 `ecall` 指令时：
+
+```text
+ecall
+ → TCG 在翻译阶段识别为异常触发指令
+ → 生成用于触发异常的 helper 调用
+ → 标记当前 Translation Block 结束
+ → 在执行阶段由 helper 设置 sepc / scause / sstatus
+ → 进入异常处理流程
+```
+
+- 当 QEMU 在翻译阶段遇到 `sret` 指令时：
+
+```text
+sret
+ → TCG 在翻译阶段识别为特权返回指令
+ → 生成对应的 helper 调用
+ → 标记当前 Translation Block 结束
+ → 在执行阶段由 helper 从 CSR 中恢复 sepc 与特权级状态
+ → 从恢复后的 PC 开始翻译并执行新的 TB
+```
+
+
+
+
+
+#### 细节补充
+在 QEMU GDB 中尝试设置与 RISC-V 指令翻译和异常处理相关的断点：
+
+```gdb
+break riscv_tr_translate_insn
+break trans_ecall
+break helper_sret
+break riscv_cpu_do_interrupt
+break generate_exception
+```
+
+这些断点均显示为 **pending**，提示当前 QEMU 二进制中未加载对应符号。
+
+实际运行中，QEMU 多数时间停留在：
+
+```text
+__ppoll (fds=..., nfds=6, ...)
+```
+询问大模型原因，它告诉我是TCG 机制导致“看不到逐条执行”。
+之前介绍TCG机制提到 Guest 指令并非逐条解释执行，而是以TB为单位一次翻译，多次执行。
+- `ecall` / `sret` 这类指令在翻译阶段就被识别为 TB 的结束点或异常或特权切换边界。
+
+因此在实际执行中：
+
+```text
+Guest ecall/sret
+ → 退出当前 TB
+ → 进入 helper
+ → 完成特权级切换
+ → 从新 PC 开始翻译并执行新的 TB
+```
+
+该过程在 Host GDB 视角下表现为：
+- 执行流“跳跃式”前进，难以通过 `si` 命中具体的 helper 实现
+
+**为什么 Host GDB 常停在 __ppoll**
+
+```text
+__ppoll (...)
+```
+说明 Guest 执行已经完成一个阶段，QEMU 正在等待下一次调度或调试事件。
+![alt text](1.png)
+
