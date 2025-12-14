@@ -1706,29 +1706,10 @@ helper_le_stq_mmu (
 >2. 单步调试页表翻译的部分，解释一下关键的操作流程。
 
 页表翻译部分是虚拟地址翻译成物理地址的关键部分，我们在**1**小节中的**页表翻译——读取页表项值**和**页表翻译——得到物理地址**中已经进行了详细的介绍。
-
----
-这是一份基于你提供的终端真实输出生成的实验报告。报告保持了你操作的原始记录，并按照 Lab 要求的格式进行了整理和分析。
-
 -----
 
-## 分支任务：gdb 调试页表查询过程 (Lab 2)
 
-### 1\. 实验环境与调试策略
-
-本次实验利用“双重 GDB”策略，在观察 uCore 内核运行的同时，深入 QEMU 源码层面观察硬件 MMU 的行为。
-
-#### 三个终端及其作用
-
-1.  **终端 1**：启动 QEMU 模拟器。运行 `make debug`，QEMU 暂停在初始状态等待连接。
-2.  **终端 2**：调试 QEMU 源码（外层调试）。
-      * **作用**：附加到 QEMU 进程，追踪 `riscv_cpu_tlb_fill` 和 `get_physical_address` 等函数，观察地址翻译的硬件模拟逻辑。
-3.  **终端 3**：调试 uCore 内核（内层调试）。
-      * **作用**：控制内核执行流，单步执行访存指令以触发 TLB Miss。
-
------
-
-### 2\. 在终端 3 中定位访存指令
+>3.是否能够在qemu-4.1.1的源码中找到模拟cpu查找tlb的C代码，通过调试说明其中的细节。（按照riscv的流程，是不是应该先查tlb，tlbmiss之后才从页表中查找，给我找一下查找tlb的代码）
 
 我们首先在终端 3 中启动 GDB 连接到 QEMU，并在内核初始化入口 `kern_init` 处设置断点。
 
@@ -1829,7 +1810,6 @@ get_physical_address (env=0x5ccea4a292a0, physical=0x7c03d19fe230, prot=0x7c03d1
 <img width="1595" height="775" alt="image" src="https://github.com/user-attachments/assets/ce6457e2-efc8-4fdf-94f4-3391c9cb5053" />
 
 
-#### 3.2 页表翻译流程 (Page Walk)
 
 进入 `get_physical_address` 后，QEMU 模拟了硬件 Page Walker 的行为。
 
@@ -1895,7 +1875,6 @@ get_physical_address (env=0x5ccea4a292a0, physical=0x7c03d19fe230, prot=0x7c03d1
 <img width="1633" height="792" alt="image" src="https://github.com/user-attachments/assets/6752b686-c0d4-48d1-8f8c-87c247ef4a4c" />
 
 
-#### 3.3 TLB 填充与实际访存
 
 翻译成功后，回到 `riscv_cpu_tlb_fill`，代码将结果填入软件 TLB 并重试访存。
 
@@ -1923,8 +1902,31 @@ store_helper (big_endian=false, size=1, ..., addr=18446744072637931544, env=0x5c
 
 `stb_p(haddr, val)` (Store Byte Physical) 这一行代码执行后，内存 `0xffffffffc0206018` 处的值被真正修改。
 
+>4.仍然是tlb，qemu中模拟出来的tlb和我们真实cpu中的tlb有什么逻辑上的区别（提示：可以尝试找一条未开启虚拟地址空间的访存语句进行调试，看看调用路径，和开启虚拟地址空间之后的访存语句对比）
+
+基于 GDB 对 QEMU 的调试输出，观察到在 Guest OS 未开启分页机制（CR0.PG=0）的情况下，执行访存指令仍然触发了 SoftMMU 的相关函数调用。
+
+具体表现为：
+* **调用路径：** `helper_ld*_mmu` $\rightarrow$ `tlb_fill` $\rightarrow$ `get_phys_addr`。
+而在真实硬件逻辑中，当 CPU 处于实模式或未开启分页的保护模式时，应当直接绕过 TLB 硬件，将地址直接送往地址总线。然而 GDB 的 Backtrace 显示 QEMU 依然进入了 `tlb_fill`（TLB 填充）流程。
+
+该现象揭示了 QEMU 模拟的 SoftMMU TLB 与真实 CPU 硬件 TLB 在设计逻辑上的本质区别：
+
+**(1) 映射目标的差异**
+* **真实硬件 TLB：** 缓存 **Guest Virtual Address (GVA) $\rightarrow$ Guest Physical Address (GPA)** 的映射。当分页关闭时，GVA 直接等于 GPA，硬件无需查表。
+* **QEMU SoftMMU TLB：** 缓存 **Guest Virtual Address (GVA) $\rightarrow$ Host Virtual Address (HVA)** 的映射。
+    * QEMU 作为宿主机上的用户态进程，无法直接访问物理内存。虚拟机所谓的“物理内存”实际上是 QEMU 进程通过 `malloc/mmap` 在宿主机上申请的一块虚拟内存区域。
+    * 因此，无论 Guest 是否开启分页，QEMU 都必须将 Guest 想要访问的地址翻译为宿主机的有效地址（HVA）才能完成读写操作。
+
+**(2) “未开启分页”的实现机制差异**
+* **真实硬件：** “关闭分页”意味着物理上关闭地址翻译电路的激活路径。
+* **QEMU 模拟：** “关闭分页”被视为一种特殊的地址翻译模式。
+    * 在 `get_phys_addr` 函数中，当检测到 CR0.PG=0 时，QEMU 并不跳过 TLB，而是执行“恒等映射”（Identity Mapping），即直接返回输入的地址作为 GPA，随后继续计算对应的 HVA 并填入 SoftMMU TLB。
+    * 这就是为何在 GDB 中观察到即使没有分页，访存操作依然依赖 TLB 路径。
+
+QEMU 的 SoftMMU TLB 并非是对硬件 TLB 行为的 1:1 精确模拟，而是一个**为了加速 Guest 内存访问的软件加速层**。它利用 TLB 机制统一处理了“GVA到GPA的翻译（架构模拟）”和“GPA到HVA的翻译（虚拟化实现）”。因此，在 QEMU 中，TLB 查找是所有访存指令的必经路径。
 >5.记录下你调试过程中比较抓马有趣的细节，以及在观察模拟器通过软件模拟硬件执行的时候了解到的知识。
->
+
 调试的时候经常碰到找不到文件的问题，实际上是因为qemu文件找不到（因为是自己编译的），改了make file之后才正常编译。
 
 刚开始用双重 GDB 的时候，我在第二个终端输入 b get_physical_address，然后回车。结果 GDB 死机了一样，以为是 Ubuntu 卡死了，或者 QEMU 崩溃了。 问了大模型才知道，QEMU 在跑的时候 GDB 是不能输入的。
