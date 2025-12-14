@@ -1683,13 +1683,13 @@ QEMU 的 `cputlb.c` 实现了对硬件 TLB 行为的精确模拟：**先查快�
 
 #### 一、启动 QEMU 并附加 Host GDB
 
-在 **终端一** 启动 QEMU 调试模式：
+在终端一启动 QEMU 调试模式：
 
 ```bash
 make debug
 ```
 
-在 **终端二** 查询 QEMU 进程号：
+在终端二查询 QEMU 进程号：
 
 ```bash
 pgrep -f qemu-system-riscv64
@@ -1702,7 +1702,7 @@ sudo gdb
 (gdb) attach <PID>
 ```
 
-此时该 GDB 用于调试 **QEMU 模拟器本身（Host 侧）**。
+此时该 GDB 用于调试 QEMU 模拟器本身（Host 侧）。
 
 
 #### 二、用户态到内核态的切换（ecall）
@@ -1729,12 +1729,12 @@ sudo gdb
 pc             0x800104 0x800104 <syscall+44>
 ```
 
-此时可以确认 CPU 仍处于 **用户态（U-mode）**，即将执行 `ecall` 指令。
+此时可以确认 CPU 仍处于用户态，即将执行 `ecall` 指令。
 
 
 **2. 在 QEMU GDB 中捕获 ecall 的翻译**
 
-切换到 **QEMU GDB 窗口**，按下 `Ctrl+C` 中断 QEMU 执行，
+切换到QEMU GDB 窗口，按下 `Ctrl+C` 中断 QEMU 执行，
 设置断点以拦截 RISC-V 指令的翻译过程：
 
 ```gdb
@@ -1752,13 +1752,7 @@ pc             0x800104 0x800104 <syscall+44>
 
 **3. ecall 执行后的行为观察**
 
-在 Guest GDB 中单步执行 `ecall`：
-
-```gdb
-si
-```
-
-可以直接观察到 PC 跳转至内核地址空间：
+在 Guest GDB 中单步执行，可以直接观察到 PC 跳转至内核地址空间：
 
 ```text
 0xffffffffc0200ecc in __alltraps ()
@@ -1797,16 +1791,7 @@ Breakpoint 2, __trapret ()
     sret
 ```
 
-此时 CPU 仍处于 **S-mode（内核态）**，并即将执行 `sret` 指令。
-`sret` 是 RISC-V 特权架构中用于 **从 S-mode 返回到 U-mode** 的指令，
-其语义包括：
-
-- `pc ← sepc`
-- 根据 `sstatus` 恢复特权级
-- 返回到触发异常的下一条指令
-
-
-在 GDB 中对 `sret` 单步执行：
+此时 CPU 仍处于内核态，并即将执行 `sret` 指令。在 GDB 中对 `sret` 单步执行：
 
 ```gdb
 (gdb) si
@@ -1879,8 +1864,7 @@ break generate_exception
 __ppoll (fds=..., nfds=6, ...)
 ```
 询问大模型原因，它告诉我是TCG 机制导致“看不到逐条执行”。
-之前介绍TCG机制提到 Guest 指令并非逐条解释执行，而是以TB为单位一次翻译，多次执行。
-- `ecall` / `sret` 这类指令在翻译阶段就被识别为 TB 的结束点或异常或特权切换边界。
+之前介绍TCG机制提到 Guest 指令并非逐条解释执行，而是以TB为单位一次翻译，多次执行。`ecall` / `sret` 这类指令在翻译阶段就被识别为 TB 的结束点或异常或特权切换边界。
 
 因此在实际执行中：
 
@@ -1893,13 +1877,10 @@ Guest ecall/sret
 ```
 
 该过程在 Host GDB 视角下表现为：
-- 执行流“跳跃式”前进，难以通过 `si` 命中具体的 helper 实现
+执行流“跳跃式”前进，难以通过 `si` 命中具体的 helper 实现
 
 **为什么 Host GDB 常停在 __ppoll**
 
-```text
-__ppoll (...)
-```
 说明 Guest 执行已经完成一个阶段，QEMU 正在等待下一次调度或调试事件。
 ![alt text](1.png)
 
