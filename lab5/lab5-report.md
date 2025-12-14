@@ -308,25 +308,8 @@ uCore 的物理内存管理（`pmm.c`）中，每个物理页对应一个 `struc
             1.  修改当前 PTE：加上 `PTE_W`，去掉 `PTE_COW`。
             2.  `tlb_invalidate()` 刷新 TLB。
 
-#### 4\. 状态转换图 (Finite State Machine)
 
-```mermaid
-stateDiagram-v2
-    [*] --> PrivateW : alloc_page
-    
-    state "Private-W\n(Ref=1, W=1, COW=0)" as PrivateW
-    state "Shared-RO\n(Ref>1, W=0, COW=1)" as SharedRO
-    
-    PrivateW --> SharedRO : fork() \n[父子进程PTE: -W, +COW, Ref++]
-    
-    SharedRO --> PrivateW : Write Fault (Ref==1) \n[PTE: +W, -COW]
-    
-    SharedRO --> PrivateW : Write Fault (Ref>1) \n[Alloc New Page, Copy, Ref--]
-    
-    SharedRO --> SharedRO : Read Access \n[No Fault]
-```
-
-#### 5\. 边界情况与设计细节
+#### 4\. 边界情况与设计细节
 
   * **只读页面的处理**：如果原页面本身就是只读的（比如代码段），在 `fork` 时不应该设置 `PTE_COW`，也不应该去掉 `PTE_W`（因为它本来就没有）。这些页面应该保持普通的只读共享，引用计数增加即可。写这些页面会触发普通的 Access Fault，而不是 COW 逻辑。
   * **多级 fork**：进程 A `fork` B，B 又 `fork` C。
