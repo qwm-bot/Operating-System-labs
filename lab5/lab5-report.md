@@ -759,5 +759,619 @@ free_page(npage); // 释放未使用的npage
 
 ## 扩展练习二
 >说明该用户程序是何时被预先加载到内存中的？与我们常用操作系统的加载有何区别，原因是什么？
-## 实验设计的知识点
+## 实验涉及的知识点
+1. **Copy-On-Write（COW）机制简介**
+
+    Copy-On-Write（写时复制）是操作系统在进程创建与内存管理中常用的一种优化策略。当一个进程通过 `fork()` 创建子进程时，父子进程通常会共享相同的物理内存页，并将这些页标记为只读。只有当某个进程尝试对共享页执行写操作时，内核才会触发“写时复制”：为该进程分配一个新的物理页，并将原页内容复制过去，然后允许写入。COW 的核心作用是避免在 `fork()` 后立即复制全部内存，从而显著减少内存开销，提高进程创建性能，同时保证父子进程之间的内存隔离性和独立性。
+
 ## 分支任务
+### lab2
+>1. 尝试理解我们调试流程中涉及到的qemu的源码，给出关键的调用路径，以及路径上一些关键的分支语句（不是让你只看分支语句），并通过调试演示某个访存指令访问的虚拟地址是如何在qemu的模拟中被翻译成一个物理地址的。
+#### 三个终端以及作用
+1. 终端1：启动QEMU模拟器\\
+作用：运行调试版QEMU，模拟RISC-V硬件，并加载ucore内核。QEMU会暂停在初始状态，等待调试器连接。这是整个调试环境的“外壳”；
+2. 终端2：附加调试QEMU进程（调试QEMU源码）\\
+作用：使用GDB附加到QEMU进程本身，调试QEMU的C源码（模拟硬件MMU的地址转换逻辑）。这里观察的是“软件模拟硬件”的过程，例如TLB查询、页表遍历等。这是外层调试，重点关注QEMU如何处理访存指令。
+3. 终端3：调试ucore内核\\
+作用：使用RISC-V专用GDB连接到QEMU的GDB stub，调试运行在QEMU中的ucore内核代码。这是内层调试，观察ucore的访存指令（虚拟地址访问）。
+#### 在终端3中找到访存指令
+```bash
+0x0000000000001000 in ?? ()
+(gdb) break kern_init
+Breakpoint 1 at 0xffffffffc02000d6: file kern/init/init.c, line 31.
+(gdb) continue
+Continuing.
+
+Breakpoint 1, kern_init ()
+    at kern/init/init.c:31
+31          memset(edata, 0, end - edata);
+(gdb) x/10i $pc
+=> 0xffffffffc02000d6 <kern_init>:
+    auipc       a0,0x6
+   0xffffffffc02000da <kern_init+4>:
+    addi        a0,a0,-190
+   0xffffffffc02000de <kern_init+8>:
+    auipc       a2,0x6
+   0xffffffffc02000e2 <kern_init+12>:
+    addi        a2,a2,242
+   0xffffffffc02000e6 <kern_init+16>:
+    addi        sp,sp,-16
+   0xffffffffc02000e8 <kern_init+18>:
+    sub a2,a2,a0
+   0xffffffffc02000ea <kern_init+20>:
+    li  a1,0
+   0xffffffffc02000ec <kern_init+22>:
+    sd  ra,8(sp)
+   0xffffffffc02000ee <kern_init+24>:
+    jal 0xffffffffc020157c <memset>
+   0xffffffffc02000f2 <kern_init+28>:
+    jal 0xffffffffc0200228 <dtb_init>
+```
+我们首先在init.c的kern_init函数的入口处打断点，用`continue`让uCore的程序运行到此处，然后用`x/10i $pc`打印接下来的十条指令，锁定一条访存指令0xffffffffc02000ec <kern_init+22>: sd  ra,8(sp),于是我们在终端三中，用`break *0xffffffffc02000ec`在0xffffffffc02000ec处打上断点;
+#### TLB查询&未命中
+由于我们想要追踪`访存指令->TLB 查询->TLB 未命中->页表翻译->权限检查 & 异常判断->TLB 填充->得到物理地址`的全过程，所以我们在终端二中用`break riscv_cpu_tlb_fill`打断点。整体效果如下：
+```bash
+\\终端2
+(gdb) break riscv_cpu_tlb_fill
+Breakpoint 1 at 0x5d5cdaadac22: file /mnt/d/qemu-4.1.1/target/riscv/cpu_helper.c, line 438.
+(gdb) continue
+Continuing.
+[Switching to Thread 0x71b603fff640 (LWP 42209)]
+
+Thread 3 "qemu-system-ris" hit Breakpoint 1, riscv_cpu_tlb_fill (cs=0x5d5cfe76ac00, address=18446744072637927416, size=8, access_type=MMU_DATA_STORE, mmu_idx=1, probe=false, retaddr=125026637480261) at /mnt/d/qemu-4.1.1/target/riscv/cpu_helper.c:438
+438     {
+```
+```bash
+\\终端3
+(gdb) break *0xffffffffc02000ec
+Breakpoint 2 at 0xffffffffc02000ec: file kern/init/init.c, line 29.
+(gdb) continue
+Continuing.
+
+Breakpoint 2, 0xffffffffc02000ec in kern_init () at kern/init/init.c:29
+29      int kern_init(void) {
+(gdb) si
+```
+我们在终端二中单步调试，偶尔用`next`跳过一些不重要的断言和检查函数，观察函数`riscv_cpu_tlb_fill`的整体逻辑
+```bash
+\\终端2
+(gdb) step
+440         RISCVCPU *cpu = RISCV_CPU(cs);
+(gdb) step
+object_dynamic_cast_assert (obj=0x5d5cfe76ac00, typename=0x5d5cdafd80f4 "riscv-cpu", file=0x5d5cdafd80c8 "/mnt/d/qemu-4.1.1/target/riscv/cpu_helper.c", line=440, func=0x5d5cdafd8270 <__func__.3> "riscv_cpu_tlb_fill") at qom/object.c:772
+772         trace_object_dynamic_cast_assert(obj ? obj->class->type->name : "(null)",
+(gdb) next
+779         for (i = 0; obj && i < OBJECT_CLASS_CAST_CACHE; i++) {
+(gdb) step
+780             if (atomic_read(&obj->class->object_cast_cache[i]) == typename) {
+(gdb) step
+779         for (i = 0; obj && i < OBJECT_CLASS_CAST_CACHE; i++) {
+(gdb) step
+780             if (atomic_read(&obj->class->object_cast_cache[i]) == typename) {
+(gdb) step
+781                 goto out;
+(gdb) step
+805         return obj;
+(gdb) step
+806     }
+(gdb) step
+riscv_cpu_tlb_fill (cs=0x5d5cfe76ac00, address=18446744072637927416, size=8, access_type=MMU_DATA_STORE, mmu_idx=1, probe=false, retaddr=125026637480261) at /mnt/d/qemu-4.1.1/target/riscv/cpu_helper.c:441
+441         CPURISCVState *env = &cpu->env;
+(gdb) step
+442         hwaddr pa = 0;
+(gdb) step
+444         bool pmp_violation = false;
+(gdb) step
+445         int ret = TRANSLATE_FAIL;
+(gdb) step
+446         int mode = mmu_idx;
+(gdb) step
+448         qemu_log_mask(CPU_LOG_MMU, "%s ad %" VADDR_PRIx " rw %d mmu_idx %d\n",
+(gdb) step
+qemu_loglevel_mask (mask=4096) at /mnt/d/qemu-4.1.1/include/qemu/log-for-trace.h:29
+29          return (qemu_loglevel & mask) != 0;
+(gdb) step
+30      }
+(gdb) next
+riscv_cpu_tlb_fill (cs=0x5d5cfe76ac00, address=18446744072637927416, size=8, access_type=MMU_DATA_STORE, mmu_idx=1, probe=false, retaddr=125026637480261) at /mnt/d/qemu-4.1.1/target/riscv/cpu_helper.c:451
+451         ret = get_physical_address(env, &pa, &prot, address, access_type, mmu_idx);
+```
+在本次调试中，通过在 QEMU 源码中设置断点 `riscv_cpu_tlb_fill`，观察到一次由访存指令触发的 TLB 未命中处理流程。当模拟的 RISC-V 处理器执行一条数据写访存指令时，由于对应虚拟地址未命中 TLB，QEMU 进入软件 MMU 的处理路径。
+
+调试过程中，GDB 首先在函数 `riscv_cpu_tlb_fill` 处命中断点：
+
+```text
+Thread hit Breakpoint, riscv_cpu_tlb_fill(..., address=..., access_type=MMU_DATA_STORE, mmu_idx=1)
+```
+
+该函数是 RISC-V 架构在 QEMU 中处理 TLB miss 的核心入口，其作用是在 TLB 未命中时，通过页表遍历完成虚拟地址到物理地址的翻译，并将结果填充回 TLB。
+
+在函数开头，QEMU 首先将通用的 `CPUState *cs` 转换为 `RISCVCPU *cpu`，并进一步取得当前 CPU 的架构状态结构体 `CPURISCVState *env`：
+
+```c
+RISCVCPU *cpu = RISCV_CPU(cs);
+CPURISCVState *env = &cpu->env;
+```
+
+随后初始化物理地址变量 `pa`、访问权限 `prot` 以及返回状态 `ret`，并根据 `mmu_idx` 确定当前的访问模式（如用户态或内核态）。其中，`access_type=MMU_DATA_STORE` 表明此次访问是一次数据写操作。
+
+在完成必要的准备工作后，函数调用：
+
+```c
+ret = get_physical_address(env, &pa, &prot, address, access_type, mmu_idx);
+```
+该调用标志着正式进入页表翻译阶段。
+#### 页表翻译前的检查阶段
+为了更好的对调试信息进行分析，我们下面仅展示输出的qemu源码，省略输入的单步调试`step`指令：
+```bash
+step
+get_physical_address (env=0x5d5cfe773610, physical=0x71b603ffe220, prot=0x71b603ffe214, addr=18446744072637927416, access_type=1, mmu_idx=1) at /mnt/d/qemu-4.1.1/target/riscv/cpu_helper.c:158
+158     {
+163         int mode = mmu_idx;
+165         if (mode == PRV_M && access_type != MMU_INST_FETCH) {
+171         if (mode == PRV_M || !riscv_feature(env, RISCV_FEATURE_MMU)) {
+riscv_feature (env=0x5d5cfe773610, feature=0) at /mnt/d/qemu-4.1.1/target/riscv/cpu.h:243
+243         return env->features & (1ULL << feature);
+step
+244     }
+step
+get_physical_address (env=0x5d5cfe773610, physical=0x71b603ffe220, prot=0x71b603ffe214, addr=18446744072637927416, access_type=1, mmu_idx=1) at /mnt/d/qemu-4.1.1/target/riscv/cpu_helper.c:177
+177         *prot = 0;
+181         int mxr = get_field(env->mstatus, MSTATUS_MXR);
+183         if (env->priv_ver >= PRIV_VERSION_1_10_0) {
+184             base = get_field(env->satp, SATP_PPN) << PGSHIFT;
+185             sum = get_field(env->mstatus, MSTATUS_SUM);
+186             vm = get_field(env->satp, SATP_MODE);
+187             switch (vm) {
+191               levels = 3; ptidxbits = 9; ptesize = 8; break;
+223         CPUState *cs = env_cpu(env);
+env_cpu (env=0x5d5cfe773610) at /mnt/d/qemu-4.1.1/include/exec/cpu-all.h:404
+404         return &env_archcpu(env)->parent_obj;
+step
+env_archcpu (env=0x5d5cfe773610) at /mnt/d/qemu-4.1.1/include/exec/cpu-all.h:393
+393         return container_of(env, ArchCPU, env);
+step
+394     }
+step
+env_cpu (env=0x5d5cfe773610) at /mnt/d/qemu-4.1.1/include/exec/cpu-all.h:405
+405     }
+get_physical_address (env=0x5d5cfe773610, physical=0x71b603ffe220, prot=0x71b603ffe214, addr=18446744072637927416, access_type=1, mmu_idx=1) at /mnt/d/qemu-4.1.1/target/riscv/cpu_helper.c:224
+224         int va_bits = PGSHIFT + levels * ptidxbits;
+225         target_ulong mask = (1L << (TARGET_LONG_BITS - (va_bits - 1))) - 1;
+226         target_ulong masked_msbs = (addr >> (va_bits - 1)) & mask;
+227         if (masked_msbs != 0 && masked_msbs != mask) {
+231         int ptshift = (levels - 1) * ptidxbits;
+```
+在 TLB 未命中后，QEMU 进入函数 `get_physical_address`，开始进行虚拟地址到物理地址翻译前的准备工作。通过 GDB 单步调试，可以将该阶段划分为以下几个关键步骤。
+
+首先，函数根据传入的 `mmu_idx` 确定当前处理器的运行特权级：
+
+```c
+int mode = mmu_idx;
+```
+
+随后，QEMU 判断当前是否处于 M 模式，以及是否启用了 MMU：
+
+```c
+if (mode == PRV_M || !riscv_feature(env, RISCV_FEATURE_MMU)) {
+    ...
+}
+```
+
+调试中可以看到，`riscv_feature(env, RISCV_FEATURE_MMU)` 返回非零，说明当前处理器启用了 MMU，因此不会直接采用“虚拟地址等于物理地址”的直映方式，而是进入页表翻译流程。
+
+接下来，函数初始化访问权限标志，并从控制寄存器中读取与地址翻译相关的状态信息：
+
+```c
+*prot = 0;
+int mxr = get_field(env->mstatus, MSTATUS_MXR);
+```
+
+在 RISC-V 特权架构版本大于等于 1.10 的情况下，QEMU 会进一步解析 `satp` 和 `mstatus` 寄存器，用于确定页表根地址、访问权限放宽规则以及虚拟内存模式：
+
+```c
+base = get_field(env->satp, SATP_PPN) << PGSHIFT;
+sum  = get_field(env->mstatus, MSTATUS_SUM);
+vm   = get_field(env->satp, SATP_MODE);
+```
+
+其中，`base` 表示页表根节点的物理地址，`vm` 用于指定当前采用的虚拟内存模式。根据调试结果，`vm` 对应的分支设置为：
+
+```c
+levels = 3;
+ptidxbits = 9;
+ptesize = 8;
+```
+
+这表明当前系统使用的是 **Sv39 分页机制**，即三级页表结构，每级页表索引占 9 位，每个页表项大小为 8 字节。
+
+在正式进入页表遍历之前，QEMU 会根据分页级数计算虚拟地址的有效位宽，并检查虚拟地址高位是否合法：
+
+```c
+int va_bits = PGSHIFT + levels * ptidxbits;
+target_ulong masked_msbs = (addr >> (va_bits - 1)) & mask;
+```
+
+若虚拟地址的高位不满足符号扩展规则，则会触发地址异常。调试过程中该检查通过，说明当前访问的虚拟地址格式合法。
+
+至此，QEMU 已完成页表翻译前的所有准备工作，包括特权级判断、分页模式解析、页表根地址计算以及虚拟地址合法性检查，为后续的多级页表遍历奠定了基础。
+
+> 本阶段尚未进行页表项的实际读取与遍历，仅完成了分页模式判断与翻译参数初始化，真正的页表翻译过程从后续的 `for (i = 0; i < levels; i++)` 循环开始。
+#### 页表翻译——读取页表项值
+我们继续用`step`在终端2中进行单步调试，观察`get_physical_address`的执行流程。
+
+**① 进入页表遍历主循环（L2）**
+
+```text
+target/riscv/cpu_helper.c:237
+237     for (i = 0; i < levels; i++, ptshift -= ptidxbits) {
+```
+
+* `i = 0`
+* Sv39 模式下：这是 **L2（最高级页表）**
+
+---
+
+**② 计算页表索引 VPN[2]**
+
+```text
+target/riscv/cpu_helper.c:238
+238         target_ulong idx = (addr >> (PGSHIFT + ptshift)) &
+239                            ((1 << ptidxbits) - 1);
+```
+
+* 从虚拟地址中提取 VPN[2]
+* `ptshift = 18`（Sv39）
+* `idx`：当前页表项索引
+
+---
+ **③ 计算页表项物理地址**
+
+```text
+target/riscv/cpu_helper.c:242
+242         target_ulong pte_addr = base + idx * ptesize;
+```
+
+* `base`：当前页表基址（初始为 satp 中的根页表 PPN）
+* `ptesize = 8`
+* 得到 **L2 页表项的物理地址**
+
+---
+**④ PMP 权限检查（通过）**
+
+```text
+target/riscv/cpu_helper.c:244
+244         if (riscv_feature(env, RISCV_FEATURE_PMP) &&
+245             !pmp_hart_has_privs(env, pte_addr,
+246                                 sizeof(target_ulong),
+247                                 PMP_READ, mmu_idx)) {
+```
+进入 PMP 子系统：
+```text
+target/riscv/pmp.c:233
+233     pmp_hart_has_privs(...)
+```
+由于内部执行过程比较繁琐并且并非页表翻译过程的关键逻辑，我们这里仅仅进行简要说明：
+```text
+pmp_get_num_rules()
+pmp_is_in_range()
+pmp_get_a_field()
+权限位匹配判断
+```
+最终结果：
+```text
+target/riscv/pmp.c:294
+294     return ret == 1 ? true : false;
+```
+**⑤ 从物理内存中读取页表项**
+
+```text
+target/riscv/cpu_helper.c:252
+252         target_ulong pte = ldq_phys(cs->as, pte_addr);
+```
+
+---
+
+**⑥ 物理内存访问路径**
+
+```text
+ldq_phys()
+ └─ address_space_ldq()
+     └─ address_space_ldq_internal()
+         └─ address_space_translate()
+             └─ flatview_translate()
+                 └─ address_space_translate_internal()
+                     └─ memory_region_is_ram()
+```
+> QEMU 通过 `ldq_phys()` 进入物理地址空间访问流程，内部经过地址空间转换、MemoryRegion 查找等步骤，最终从 RAM 中读取 8 字节数据作为页表项内容。
+---
+**⑦ 成功读取 L2 页表项**
+
+```text
+(gdb) print/x pte
+$9 = 0x5d5cdafd80c8
+```
+**总结**
+
+在 TLB 未命中后，QEMU 进入 `get_physical_address()` 函数，对虚拟地址执行多级页表遍历。在 Sv39 模式下，页表共包含三级，本次调试首先进入第一级遍历，即 L2 页表。
+
+程序在 `cpu_helper.c:237` 处进入页表遍历循环，通过对虚拟地址进行移位和掩码操作，计算得到当前级页表索引（VPN[2]），并由根页表基址计算得到该页表项的物理地址（`pte_addr`）。
+
+在实际读取页表项之前，QEMU 调用了 PMP 权限检查函数 `pmp_hart_has_privs()`，确认当前特权级下允许对该物理地址执行读操作。调试结果表明该检查顺利通过。
+
+随后，在 `cpu_helper.c:252` 处通过 `ldq_phys()` 从物理内存中读取页表项内容，成功获得 L2 页表项的值：
+```
+PTE = 0x5d5cdafd80c8
+```
+
+该结果表明当前页表项存在且可访问，后续将根据其权限位判断其是否为叶子页表项，或继续进入下一层页表（L1）进行遍历。
+#### 页表翻译——得到物理地址
+```bash
+254     target_ulong ppn = pte >> PTE_PPN_SHIFT;
+
+256     if (!(pte & PTE_V)) {
+259     } else if (!(pte & (PTE_R | PTE_W | PTE_X))) {
+262     } else if ((pte & (PTE_R | PTE_W | PTE_X)) == PTE_W) {
+265     } else if ((pte & (PTE_R | PTE_W | PTE_X)) == (PTE_W | PTE_X)) {
+268     } else if ((pte & PTE_U) && ((mode != PRV_U))) {
+273     } else if (!(pte & PTE_U) && (mode != PRV_S)) {
+276     } else if (ppn & ((1ULL << ptshift) - 1)) {
+279     } else if (access_type == MMU_DATA_LOAD &&
+                !((pte & PTE_R) || ((pte & PTE_X) && mxr))) {
+283     } else if (access_type == MMU_DATA_STORE && !(pte & PTE_W)) {
+286     } else if (access_type == MMU_INST_FETCH && !(pte & PTE_X)) {
+
+291         target_ulong updated_pte = pte | PTE_A |
+                (access_type == MMU_DATA_STORE ? PTE_D : 0);
+
+295         if (updated_pte != pte) {
+
+333         target_ulong vpn = addr >> PGSHIFT;
+334         *physical = (ppn | (vpn & ((1L << ptshift) - 1))) << PGSHIFT;
+
+337         if ((pte & PTE_R) || ((pte & PTE_X) && mxr)) {
+338             *prot |= PAGE_READ;
+340         if ((pte & PTE_X)) {
+341             *prot |= PAGE_EXEC;
+345         if ((pte & PTE_W)) {
+347             *prot |= PAGE_WRITE;
+
+349         return TRANSLATE_SUCCESS;
+353     }
+```
+**1. 提取物理页号（PPN）**
+
+```c
+target_ulong ppn = pte >> PTE_PPN_SHIFT;
+```
+
+首先从页表项中提取物理页号（Physical Page Number，PPN）。PTE 的低位用于存放权限与状态位，高位用于表示物理页号，因此需要右移 `PTE_PPN_SHIFT` 位以获得 PPN。该 PPN 是后续计算最终物理地址的基础。
+
+---
+
+**2. 页表项合法性检查（Validity Check）**
+
+```c
+if (!(pte & PTE_V)) {
+```
+
+检查 PTE 的 **V（Valid）位**。如果该位未置位，说明该页表项无效，访问将触发页故障，页表翻译失败。
+
+---
+
+**3. 判断是否为非叶子页表项**
+
+```c
+} else if (!(pte & (PTE_R | PTE_W | PTE_X))) {
+```
+
+若 `R/W/X` 位均为 0，则说明该 PTE 不是叶子页表项，而是指向下一级页表。此时页表遍历需要继续进行，而不能直接生成物理地址。
+
+---
+
+**4. 非法权限组合检查**
+
+```c
+} else if ((pte & (PTE_R | PTE_W | PTE_X)) == PTE_W) {
+} else if ((pte & (PTE_R | PTE_W | PTE_X)) == (PTE_W | PTE_X)) {
+```
+
+根据 RISC-V 规范，某些权限组合是非法的，例如：
+
+* 只写（W）但不可读
+* 写和执行同时存在但不可读
+
+这些情况将直接判定为页表项非法，防止产生未定义行为。
+
+---
+
+**5. 用户态 / 特权态访问检查**
+
+```c
+} else if ((pte & PTE_U) && (mode != PRV_U)) {
+} else if (!(pte & PTE_U) && (mode != PRV_S)) {
+```
+
+通过检查 **U 位（User）** 和当前处理器运行模式，确保：
+
+* 用户页不能被特权态错误访问
+* 特权页不能被用户态访问
+
+该机制保证了不同特权级之间的内存隔离。
+
+---
+
+**6. 大页对齐检查**
+
+```c
+} else if (ppn & ((1ULL << ptshift) - 1)) {
+```
+
+当页表项表示的是大页映射时，物理页号必须满足对齐要求。如果 PPN 的低位不为 0，则说明该大页映射非法。
+
+---
+
+**7. 根据访问类型进行权限校验**
+
+```c
+} else if (access_type == MMU_DATA_LOAD &&
+           !((pte & PTE_R) || ((pte & PTE_X) && mxr))) {
+} else if (access_type == MMU_DATA_STORE && !(pte & PTE_W)) {
+} else if (access_type == MMU_INST_FETCH && !(pte & PTE_X)) {
+```
+
+根据当前访问类型（读 / 写 / 指令取值）：
+
+* 数据读必须具备 `R` 权限（或在 MXR 模式下使用 `X`）
+* 数据写必须具备 `W` 权限
+* 指令取值必须具备 `X` 权限
+
+否则将触发访问异常。
+
+---
+
+**8. 设置 Accessed / Dirty 位**
+
+```c
+target_ulong updated_pte = pte | PTE_A |
+    (access_type == MMU_DATA_STORE ? PTE_D : 0);
+```
+
+当页表项首次被访问或发生写操作时，需要设置：
+
+* **A（Accessed）位**：表示该页已被访问
+* **D（Dirty）位**：表示该页发生过写操作
+
+这是操作系统进行页面回收和写回的重要依据。
+
+---
+**9. 生成最终物理地址**
+
+```c
+target_ulong vpn = addr >> PGSHIFT;
+*physical = (ppn | (vpn & ((1L << ptshift) - 1))) << PGSHIFT;
+```
+
+在确认该 PTE 是合法的叶子页表项后，系统开始生成最终物理地址：
+
+* 高位来自页表项中的 PPN
+* 低位来自虚拟地址中的页内偏移
+* 两者组合后左移 `PGSHIFT` 得到完整的物理地址
+
+这标志着页表翻译过程的完成。
+
+---
+**10. 设置访问权限并返回成功**
+
+```c
+if ((pte & PTE_R) || ((pte & PTE_X) && mxr)) {
+    *prot |= PAGE_READ;
+}
+if (pte & PTE_X) {
+    *prot |= PAGE_EXEC;
+}
+if (pte & PTE_W) {
+    *prot |= PAGE_WRITE;
+}
+
+return TRANSLATE_SUCCESS;
+```
+最后，根据页表项中的权限位设置该页在 TLB 中的访问权限，并返回 `TRANSLATE_SUCCESS`，表示此次虚拟地址到物理地址的翻译成功完成。
+
+---
+
+**小结**
+
+本阶段是页表翻译的**核心逻辑**，通过对页表项的合法性、权限和访问类型进行全面检查，在保证系统安全与一致性的前提下，最终完成虚拟地址到物理地址的映射，并为后续 TLB 填充提供所需信息。
+
+#### TLB填充和收尾工作
+```bash
+riscv_cpu_tlb_fill (
+    cs=0x5d5cfe76ac00,
+    address=18446744072637927416,
+    size=8,
+    access_type=MMU_DATA_STORE,
+    mmu_idx=1,
+    probe=false,
+    retaddr=125026637480261
+) at /mnt/d/qemu-4.1.1/target/riscv/cpu_helper.c:453
+453         if (mode == PRV_M && access_type != MMU_INST_FETCH) {
+
+459         qemu_log_mask(CPU_LOG_MMU,
+
+463         if (riscv_feature(env, RISCV_FEATURE_PMP) &&
+465             !pmp_hart_has_privs(env, pa, size, 1 << access_type, mode)) {
+
+pmp_hart_has_privs (
+    env=0x5d5cfe773610,
+    addr=2149597184,
+    size=8,
+    privs=PMP_WRITE,
+    mode=1
+) at /mnt/d/qemu-4.1.1/target/riscv/pmp.c:233
+233         int i = 0;
+246         for (i = 0; i < MAX_RISCV_PMPS; i++) {
+247             s = pmp_is_in_range(env, i, addr);
+248             e = pmp_is_in_range(env, i, addr + size - 1);
+251             if ((s + e) == 1) {
+260                 pmp_get_a_field(env->pmp_state.pmp[i].cfg_reg);
+266             if (((s + e) == 2) && (PMP_AMATCH_OFF != a_field)) {
+251         }
+
+Return from pmp_hart_has_privs: true
+
+Return from riscv_cpu_tlb_fill: true
+
+tlb_fill (
+    cpu=0x5d5cfe76ac00,
+    addr=18446744072637927416,
+    size=8,
+    access_type=MMU_DATA_STORE,
+    mmu_idx=1,
+    retaddr=125026637480261
+) at /mnt/d/qemu-4.1.1/accel/tcg/cputlb.c:878
+878         ok = cc->tlb_fill(cpu, addr, size, access_type, mmu_idx, false, retaddr);
+
+Return from tlb_fill: true
+
+store_helper (
+    big_endian=false,
+    size=8,
+    val=2147486210,
+    addr=18446744072637927416,
+    env=0x5d5cfe773610
+) at /mnt/d/qemu-4.1.1/accel/tcg/cputlb.c:1524
+1524                index = tlb_index(env, mmu_idx, addr);
+
+helper_le_stq_mmu (
+    env=0x5d5cfe773610,
+    addr=18446744072637927416,
+    val=2147486210,
+    oi=49,
+    retaddr=125026637480261
+) at /mnt/d/qemu-4.1.1/accel/tcg/cputlb.c:1673
+1673    }
+```
+在完成页表遍历并计算出物理页号后，QEMU 进入 `riscv_cpu_tlb_fill` 函数，对生成的物理地址进行进一步检查与处理。
+此阶段主要负责 **特权级判断、PMP权限校验以及 TLB 填充**。
+
+在 `cpu_helper.c:463–465` 处，若处理器支持 PMP，则调用 `pmp_hart_has_privs` 对计算得到的物理地址 `pa` 进行访问权限检查。
+调试过程中进入 `pmp_hart_has_privs`，该函数通过遍历 PMP 表项，判断目标地址区间是否匹配某一 PMP 规则，并结合访问类型（本次为数据写操作）与当前特权级（Supervisor 模式）确认访问是否合法。
+从调试结果可以看到，该函数最终返回 `true`，表示该物理地址写权限检查通过。
+
+随后 `riscv_cpu_tlb_fill` 正常返回，表明虚拟地址到物理地址的翻译及权限验证均成功完成。
+接着执行 `tlb_fill`，将本次翻译结果写入 TLB，以加速后续对该地址的访问。
+
+在 TLB 填充完成后，系统继续执行 `store_helper`以及 `helper_le_stq_mmu`，最终使用已经确认合法的物理地址完成一次实际的内存写操作。
+
+通过以上调试过程可以确认，QEMU 中一次完整的虚拟地址到物理地址的数据写访问，严格按照 **页表翻译 → 权限校验（PMP）→ TLB 更新 → 实际访存** 的流程执行。
+
+---
+
+**到此，访存指令的qemu源码调试就结束了！**
+![alt text](image-3.png)
+
+---
+>2. 单步调试页表翻译的部分，解释一下关键的操作流程。
+
+页表翻译部分是虚拟地址翻译成物理地址的关键部分，我们在**1**小节中的**页表翻译——读取页表项值**和**页表翻译——得到物理地址**中已经进行了详细的介绍。
