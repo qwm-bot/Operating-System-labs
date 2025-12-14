@@ -1706,6 +1706,7 @@ helper_le_stq_mmu (
 >2. 单步调试页表翻译的部分，解释一下关键的操作流程。
 
 页表翻译部分是虚拟地址翻译成物理地址的关键部分，我们在**1**小节中的**页表翻译——读取页表项值**和**页表翻译——得到物理地址**中已经进行了详细的介绍。
+
 -----
 
 
@@ -1767,13 +1768,8 @@ memset (
 
 -----
 
-### 3\. QEMU 源码调试分析 (终端 2)
 
-在终端 2 中，我们附加到 QEMU 进程，并在硬件模拟层设置陷阱。
-
-#### 3.1 捕获 TLB 未命中 (TLB Miss)
-
-我们在 `riscv_cpu_tlb_fill` 处设置条件断点，拦截对目标地址 `0xffffffffc0206018` 的处理。
+我们尝试捕获 TLB 未命中，在 `riscv_cpu_tlb_fill` 处设置条件断点，拦截对目标地址 `0xffffffffc0206018` 的处理。
 
 ```bash
 user@user-virtual-machine:~/labcode/Operating-System-labs/lab2$ sudo gdb
@@ -1800,7 +1796,19 @@ Thread 3 "qemu-system-ris" hit Breakpoint 1, riscv_cpu_tlb_fill (cs=0x5ccea4a208
 440         RISCVCPU *cpu = RISCV_CPU(cs);
 (gdb) n
 441         CPURISCVState *env = &cpu->env;
-# ... (省略部分初始化代码) ...
+(gdb) n
+442         hwaddr pa = 0;
+(gdb) n
+444         bool pmp_violation = false;
+(gdb) n
+445         int ret = TRANSLATE_FAIL;
+(gdb) n
+446         int mode = mmu_idx;
+(gdb) n
+448         qemu_log_mask(CPU_LOG_MMU, "%s ad %" VADDR_PRIx " rw %d mmu_idx %d\n",
+(gdb) n
+451         ret = get_physical_address(env, &pa, &prot, address, access_type, mmu_idx);
+(gdb) s
 451         ret = get_physical_address(env, &pa, &prot, address, access_type, mmu_idx);
 (gdb) s
 get_physical_address (env=0x5ccea4a292a0, physical=0x7c03d19fe230, prot=0x7c03d19fe224, addr=18446744072637931544, access_type=1, mmu_idx=1) at /home/user/qemu-4.1.1/target/riscv/cpu_helper.c:158
