@@ -9,7 +9,16 @@
     # If coming from userspace, preserve the user stack pointer and load
     # the kernel stack pointer. If we came from the kernel, sscratch
     # will contain 0, and we should continue on the current stack.
-    csrrw sp, sscratch, sp
+    # 若在中断之前处于 U mode(用户态)
+    # 则 sscratch 保存的是内核栈地址
+    # 否则中断之前处于 S mode(内核态)，sscratch 保存的是 0
+    
+    csrrw sp, sscratch, sp  # 交换sp和sccratch寄存器
+
+    #sp为0，说明之前是内核态，我们刚才把内核栈指针换到了sscratch, 需要再拿回来
+    #sp不为0 时，说明之前是用户态，sp里现在存的就是内核栈指针，sscratch里现在是用户栈指针
+    #sp不为0，就跳到_save_context, 跳过_restore_kernel_sp的代码
+
     bnez sp, _save_context
 
 _restore_kernel_sp:
@@ -52,18 +61,18 @@ _save_context:
     # get sr, epc, tval, cause
     # Set sscratch register to 0, so that if a recursive exception
     # occurs, the exception vector knows it came from the kernel
-    csrrw s0, sscratch, x0
-    csrr s1, sstatus
-    csrr s2, sepc
-    csrr s3, 0x143
-    csrr s4, scause
+    csrrw s0, sscratch, x0  #保存用户栈指针
+    csrr s1, sstatus #保存中断前的状态
+    csrr s2, sepc    #保存中断前的PC
+    csrr s3, 0x143   #stval中的CSR编号
+    csrr s4, scause  #保存异常原因
 
     STORE s0, 2*REGBYTES(sp)
     STORE s1, 32*REGBYTES(sp)
     STORE s2, 33*REGBYTES(sp)
     STORE s3, 34*REGBYTES(sp)
     STORE s4, 35*REGBYTES(sp)
-    .endm
+    .endm  # 结束宏定义
 
     .macro RESTORE_ALL
     LOCAL _save_kernel_sp
@@ -220,3 +229,7 @@ kernel_execve_ret:
     // acutually adjust sp
     move sp, a1
     j __trapret
+
+
+    #用户中断：CPU 在用户态 (U mode) 运行时发生的异常/中断，需要切换到内核栈；
+    #内核中断：CPU 在内核态 (S mode) 运行时发生的异常/中断，不需要切换栈。

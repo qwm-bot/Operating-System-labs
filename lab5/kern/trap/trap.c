@@ -208,6 +208,7 @@ void exception_handler(struct trapframe *tf)
             tf->epc += 4;
             syscall();
             kernel_execve_ret(tf, current->kstack + KSTACKSIZE);
+            // 在execve 成功之后，使用当前进程的 trapframe tf，并切换到该进程内核栈的栈顶，按照“从异常返回”的方式，跳转到新加载的用户程序入口执行。
         }
         break;
     case CAUSE_MISALIGNED_LOAD:

@@ -522,6 +522,7 @@ bad_fork_cleanup_proc:
 //   3. call scheduler to switch to other process
 int do_exit(int error_code)
 {
+    // 检查当前进程是否为idleproc或initproc，如果是，发出panic
     if (current == idleproc)
     {
         panic("idleproc exit.\n");
@@ -530,41 +531,55 @@ int do_exit(int error_code)
     {
         panic("initproc exit.\n");
     }
+    // 获取当前进程的内存管理结构mm
     struct mm_struct *mm = current->mm;
+    // 如果mm不为空，说明是用户进程
     if (mm != NULL)
     {
+        // 切换到内核页表，确保接下来的操作在内核空间执行
         lsatp(boot_pgdir_pa);
+        // 如果mm引用计数减到0，说明没有其他进程共享此mm
         if (mm_count_dec(mm) == 0)
         {
+            // 释放用户虚拟内存空间相关的资源
             exit_mmap(mm);
             put_pgdir(mm);
             mm_destroy(mm);
         }
+        // 将当前进程的mm设置为NULL，表示资源已经释放
         current->mm = NULL;
     }
+    // 设置进程状态为PROC_ZOMBIE，表示进程已退出
     current->state = PROC_ZOMBIE;
     current->exit_code = error_code;
     bool intr_flag;
     struct proc_struct *proc;
+    //关中断
     local_intr_save(intr_flag);
     {
+        // 获取当前进程的父进程
         proc = current->parent;
+        // 如果父进程处于等待子进程状态，则唤醒父进程
         if (proc->wait_state == WT_CHILD)
         {
             wakeup_proc(proc);
         }
+        // 遍历当前进程的所有子进程
         while (current->cptr != NULL)
         {
             proc = current->cptr;
             current->cptr = proc->optr;
-
+            //从当前进程的“子进程链表”中，取出第一个子进程，并把它从链表中摘下来。
+            //当前进程的第一个孩子更新为摘下来的子进程的右兄弟
             proc->yptr = NULL;
+            // 设置子进程的父进程为initproc，并加入initproc的子进程链表
             if ((proc->optr = initproc->cptr) != NULL)
             {
                 initproc->cptr->yptr = proc;
             }
             proc->parent = initproc;
             initproc->cptr = proc;
+            // 如果子进程也处于退出状态，唤醒initproc
             if (proc->state == PROC_ZOMBIE)
             {
                 if (initproc->wait_state == WT_CHILD)
@@ -583,6 +598,12 @@ int do_exit(int error_code)
  * @binary:  the memory addr of the content of binary program
  * @size:  the size of the content of binary program
  */
+/* 注意我们需要让 CPU 进入 U mode 执行 do_execve() 加载的用户程序。
+进行系统调用 sys_exec 之后，我们在 trap 返回的时候调用了 sret 指令，
+这时只要 sstatus 寄存器的 SPP 二进制位为0，就会切换到 U mode，
+但 SPP 存储的是“进入 trap 之前来自什么特权级”，也就是说我们这里 ebreak 之后 SPP 的数值为1，
+sret 之后会回到 S mode 在内核态执行用户程序。所以 load_icode() 函数在构造新进程的时候，会把 SSTATUS_SPP 设置为0，
+使得 sret 的时候能回到 U mode */
 static int
 load_icode(unsigned char *binary, size_t size)
 {
@@ -764,14 +785,15 @@ bad_mm:
 
 // do_execve - call exit_mmap(mm)&put_pgdir(mm) to reclaim memory space of current process
 //           - call load_icode to setup new memory space accroding binary prog.
+// do_execve 用新的用户程序 ELF 替换当前进程的地址空间，使该进程从新程序入口重新开始执行。
 int do_execve(const char *name, size_t len, unsigned char *binary, size_t size)
 {
     struct mm_struct *mm = current->mm;
-    if (!user_mem_check(mm, (uintptr_t)name, len, 0))
+    if (!user_mem_check(mm, (uintptr_t)name, len, 0))  //检查name的内存空间能否被访问
     {
         return -E_INVAL;
     }
-    if (len > PROC_NAME_LEN)
+    if (len > PROC_NAME_LEN) ////进程名字的长度有上限 PROC_NAME_LEN，在proc.h定义
     {
         len = PROC_NAME_LEN;
     }
@@ -783,21 +805,24 @@ int do_execve(const char *name, size_t len, unsigned char *binary, size_t size)
     if (mm != NULL)
     {
         cputs("mm != NULL");
-        lsatp(boot_pgdir_pa);
+        lsatp(boot_pgdir_pa); // 切回内核页表
         if (mm_count_dec(mm) == 0)
         {
-            exit_mmap(mm);
+            exit_mmap(mm); 
             put_pgdir(mm);
-            mm_destroy(mm);
+            mm_destroy(mm);  //把进程当前占用的内存释放，之后重新分配内存
         }
-        current->mm = NULL;
+        current->mm = NULL;// 解除当前进程对原mm的引用
     }
+    //把新的程序加载到当前进程里的工作都在load_icode()函数里完成
     int ret;
     if ((ret = load_icode(binary, size)) != 0)
     {
-        goto execve_exit;
+        goto execve_exit; //返回不为0，则加载失败
     }
     set_proc_name(current, local_name);
+    //如果set_proc_name的实现不变, 为什么不能直接set_proc_name(current, name)?
+    //因为 name 指向的是“旧用户地址空间”的内存，而这个地址空间在 exec 过程中已经被销毁，继续使用 name 会访问非法内存
     return 0;
 
 execve_exit:
@@ -928,7 +953,10 @@ kernel_execve(const char *name, unsigned char *binary, size_t size)
     cprintf("ret = %d\n", ret);
     return ret;
 }
-
+// do_execve() load_icode() 里面只是构建了用户程序运行的上下文，但是并没有完成切换。上下文切换实际上要借助中断处理的返回来完成。直接调用 do_execve() 是无法完成上下文切换的。
+// ecall是系统调用，ebreak是异常
+//系统调用号，name,len,binary,size等参数，a7表示系统调用异常，ebreak触发异常
+//execve() 是操作系统中用于“用一个新程序替换当前进程”的系统调用。它不会创建新进程，而是让当前进程“重生”为另一个程序”
 #define __KERNEL_EXECVE(name, binary, size) ({           \
     cprintf("kernel_execve: pid = %d, name = \"%s\".\n", \
             current->pid, name);                         \
@@ -988,6 +1016,17 @@ init_main(void *arg)
     cprintf("init check memory pass.\n");
     return 0;
 }
+/* 
+init_main
+ └─ kernel_thread(user_main)
+     └─ KERNEL_EXECVE(exit)
+         └─ kernel_execve
+             └─ ebreak
+                 └─ trap handler
+                     └─ sys_exec
+                         └─ do_execve
+                             └─ sret → 用户态 */
+
 
 // proc_init - set up the first kernel thread idleproc "idle" by itself and
 //           - create the second kernel thread init_main
