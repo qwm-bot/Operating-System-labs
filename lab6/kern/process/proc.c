@@ -139,6 +139,12 @@ alloc_proc(void)
         proc->cptr = NULL;
         proc->optr = NULL;
         proc->yptr = NULL;
+        proc->rq = NULL;
+        list_init(&(proc->run_link));
+        proc->time_slice = 0;
+        skew_heap_init(&(proc->lab6_run_pool));
+        proc->lab6_stride = 0;
+        proc->lab6_priority = 1;
     }
     return proc;
 }
@@ -265,8 +271,8 @@ void proc_run(struct proc_struct *proc)
             uintptr_t satp_val = ((uintptr_t)SATP_MODE_SV39 << 60) | (next->pgdir >> RISCV_PGSHIFT);
             write_csr(satp, satp_val);
 
-            // 2. 刷新 TLB (可选，但切换页表后通常建议刷新，虽然 RISC-V 在 satp 写入时会自动处理 ASID 相关的，但这里是简单实现)
-            //    asm volatile("sfence.vma"); 
+            // 2. 刷新 TLB: 切换页表后必须执行 sfence.vma 以使新的页面映射生效
+            asm volatile("sfence.vma");
             
             // 3. 切换上下文
             switch_to(&(prev->context), &(next->context));
@@ -659,6 +665,7 @@ load_icode(unsigned char *binary, size_t size)
             perm |= (PTE_W | PTE_R);
         if (vm_flags & VM_EXEC)
             perm |= PTE_X;
+        cprintf("load_icode: ph va=0x%08x filesz=0x%08x memsz=0x%08x flags=0x%08x vm_flags=0x%08x\n", (uint32_t)ph->p_va, (uint32_t)ph->p_filesz, (uint32_t)ph->p_memsz, (uint32_t)ph->p_flags, (uint32_t)vm_flags);
         if ((ret = mm_map(mm, ph->p_va, ph->p_memsz, vm_flags, NULL)) != 0)
         {
             goto bad_cleanup_mmap;
@@ -678,6 +685,7 @@ load_icode(unsigned char *binary, size_t size)
             {
                 goto bad_cleanup_mmap;
             }
+            cprintf("map page: va=0x%08x perm=0x%08x ppn=0x%08x\n", (uint32_t)la, (uint32_t)perm, (uint32_t)page2ppn(page));
             off = start - la, size = PGSIZE - off, la += PGSIZE;
             if (end < la)
             {
@@ -711,6 +719,7 @@ load_icode(unsigned char *binary, size_t size)
             {
                 goto bad_cleanup_mmap;
             }
+            cprintf("map bss page: va=0x%08x perm=0x%08x ppn=0x%08x\n", (uint32_t)la, (uint32_t)perm, (uint32_t)page2ppn(page));
             off = start - la, size = PGSIZE - off, la += PGSIZE;
             if (end < la)
             {
@@ -736,6 +745,7 @@ load_icode(unsigned char *binary, size_t size)
     current->mm = mm;
     current->pgdir = PADDR(mm->pgdir);
     lsatp(PADDR(mm->pgdir));
+    asm volatile("sfence.vma");
 
     //(6) setup trapframe for user environment
     struct trapframe *tf = current->tf;
