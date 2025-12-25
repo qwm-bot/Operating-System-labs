@@ -143,6 +143,9 @@ void interrupt_handler(struct trapframe *tf)
 
         // lab6: YOUR CODE  (update LAB3 steps)
         //  在时钟中断时调用调度器的 sched_class_proc_tick 函数
+        if (current != NULL) {
+            sched_class_proc_tick(current);
+        }
 
         break;
     case IRQ_H_TIMER:
@@ -215,13 +218,43 @@ void exception_handler(struct trapframe *tf)
         cprintf("Environment call from M-mode\n");
         break;
     case CAUSE_FETCH_PAGE_FAULT:
-        cprintf("Instruction page fault\n");
+        if (trap_in_kernel(tf)) {
+            cprintf("Instruction page fault\n");
+            panic("Instruction page fault in kernel mode\n");
+        } else {
+            if (current) {
+                cprintf("Instruction page fault: pid=%d name=%s epc=0x%08x tval=0x%08x\n", current->pid, get_proc_name(current), tf->epc, tf->tval);
+            } else {
+                cprintf("Instruction page fault (no current)\n");
+            }
+            do_exit(-E_INVAL);
+        }
         break;
     case CAUSE_LOAD_PAGE_FAULT:
-        cprintf("Load page fault\n");
+        if (trap_in_kernel(tf)) {
+            cprintf("Load page fault\n");
+            panic("Load page fault in kernel mode\n");
+        } else {
+            if (current) {
+                cprintf("Load page fault: pid=%d name=%s epc=0x%08x tval=0x%08x\n", current->pid, get_proc_name(current), tf->epc, tf->tval);
+            } else {
+                cprintf("Load page fault (no current)\n");
+            }
+            do_exit(-E_INVAL);
+        }
         break;
     case CAUSE_STORE_PAGE_FAULT:
-        cprintf("Store/AMO page fault\n");
+        if (trap_in_kernel(tf)) {
+            cprintf("Store/AMO page fault\n");
+            panic("Store/AMO page fault in kernel mode\n");
+        } else {
+            if (current) {
+                cprintf("Store page fault: pid=%d name=%s epc=0x%08x tval=0x%08x\n", current->pid, get_proc_name(current), tf->epc, tf->tval);
+            } else {
+                cprintf("Store page fault (no current)\n");
+            }
+            do_exit(-E_INVAL);
+        }
         break;
     default:
         print_trapframe(tf);
