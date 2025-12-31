@@ -95,12 +95,11 @@ static void page_init(void)
     va_pa_offset = PHYSICAL_MEMORY_OFFSET;
 
     uint64_t mem_begin = get_memory_base();
-    uint64_t mem_size = get_memory_size();
-    if (mem_size == 0)
-    {
+    uint64_t mem_size  = get_memory_size();
+    if (mem_size == 0) {
         panic("DTB memory info not available");
     }
-    uint64_t mem_end = mem_begin + mem_size;
+    uint64_t mem_end   = mem_begin + mem_size;
 
     cprintf("physcial memory map:\n");
     cprintf("  memory: 0x%08lx, [0x%08lx, 0x%08lx].\n", mem_size, mem_begin,
@@ -172,64 +171,6 @@ static void *boot_alloc_page(void)
     return page2kva(p);
 }
 
-/**
- * from transient boot pgdir switch to a new one and add some protection
- * 1. switch pgdir
- * 2. set refined permission(rx, rw...)
- * 3. set previous transient boot pgdir and another dedicated page
- *  as guard pages for kernel stack
- */
-static void
-switch_kernel_memorylayout()
-{
-    /**
-     * Free intermediate here is uncessary because initially we use
-     * big-big-big page such that not intermediate page is occupied
-     */
-
-    // new page directory
-    pde_t *kern_pgdir = (pde_t *)boot_alloc_page();
-    memset(kern_pgdir, 0, PGSIZE);
-
-    // insert kernel mappings
-    extern const char etext[];
-    uintptr_t retext = ROUNDUP((uintptr_t)etext, PGSIZE);
-    boot_map_segment(kern_pgdir, KERNBASE, retext - KERNBASE, PADDR(KERNBASE), PTE_R | PTE_X);
-    boot_map_segment(kern_pgdir, retext, KERNTOP - retext, PADDR(retext), PTE_R | PTE_W);
-
-    // perform switch
-    boot_pgdir_va = kern_pgdir;
-    boot_pgdir_pa = PADDR(boot_pgdir_va);
-    lsatp(boot_pgdir_pa);
-    flush_tlb();
-    cprintf("Page table directory switch succeeded!\n");
-
-    /**
-     *  set up kernel stack guardian pages
-     */
-    extern char bootstackguard[], boot_page_table_sv39[];
-    if ((bootstackguard + PGSIZE == bootstack) && (bootstacktop == boot_page_table_sv39))
-    {
-        // check writeable and set 0
-        memset(boot_page_table_sv39, 0, PGSIZE);
-        bootstack[-1] = 0;
-        bootstack[-PGSIZE] = 0;
-
-        // set pages beneath and above the kernel stack as guardians
-        boot_map_segment(boot_pgdir_va, bootstackguard, PGSIZE, PADDR(bootstackguard), 0);
-        boot_map_segment(boot_pgdir_va, boot_page_table_sv39, PGSIZE, PADDR(boot_page_table_sv39), 0);
-        flush_tlb();
-
-        // the following four statements should all crash
-        // bootstack[-1] = 0;
-        // bootstack[-PGSIZE] = 0;
-        // bootstacktop[0] = 0;
-        // bootstacktop[PGSIZE-1] = 0;
-
-        cprintf("Kernel stack guardians set succeeded!\n");
-    }
-}
-
 // pmm_init - setup a pmm to manage physical memory, build PDT&PT to setup
 // paging mechanism
 //         - check the correctness of pmm & paging mechanism, print PDT&PT
@@ -253,8 +194,10 @@ void pmm_init(void)
     // pmm
     check_alloc_page();
 
-    // switch from transient boot page directory to refined kernel page directory
-    switch_kernel_memorylayout();
+    // create boot_pgdir, an initial page directory(Page Directory Table, PDT)
+    extern char boot_page_table_sv39[];
+    boot_pgdir_va = (pte_t *)boot_page_table_sv39;
+    boot_pgdir_pa = PADDR(boot_pgdir_va);
 
     check_pgdir();
 
@@ -481,11 +424,6 @@ int copy_range(pde_t *to, pde_t *from, uintptr_t start, uintptr_t end,
              * (4) build the map of phy addr of  nage with the linear addr start
              */
             
-            
-            void *src = page2kva(page);
-            void *dst = page2kva(npage);
-            memcpy(dst, src, PGSIZE);
-            ret = page_insert(to, npage, start, perm);
             assert(ret == 0);
         }
         start += PGSIZE;
