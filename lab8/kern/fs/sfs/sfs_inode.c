@@ -587,9 +587,11 @@ sfs_io_nolock(struct sfs_fs *sfs, struct sfs_inode *sin, void *buf, off_t offset
     size_t size, alen = 0;
     uint32_t ino;
     uint32_t blkno = offset / SFS_BLKSIZE;          // The NO. of Rd/Wr begin block
-    uint32_t nblks = endpos / SFS_BLKSIZE - blkno;  // The size of Rd/Wr blocks
+    uint32_t end_blkno = endpos / SFS_BLKSIZE;      // The NO. of Rd/Wr end block
+    uint32_t nblks = end_blkno - blkno;             // The size of Rd/Wr blocks
 
-  //LAB8:EXERCISE1 YOUR CODE HINT: call sfs_bmap_load_nolock, sfs_rbuf, sfs_rblock,etc. read different kind of blocks in file
+  //LAB8:EXERCISE1 2312358 
+  //HINT: call sfs_bmap_load_nolock, sfs_rbuf, sfs_rblock,etc. read different kind of blocks in file
 	/*
 	 * (1) If offset isn't aligned with the first block, Rd/Wr some content from offset to the end of the first block
 	 *       NOTICE: useful function: sfs_bmap_load_nolock, sfs_buf_op
@@ -599,9 +601,49 @@ sfs_io_nolock(struct sfs_fs *sfs, struct sfs_inode *sin, void *buf, off_t offset
      * (3) If end position isn't aligned with the last block, Rd/Wr some content from begin to the (endpos % SFS_BLKSIZE) of the last block
 	 *       NOTICE: useful function: sfs_bmap_load_nolock, sfs_buf_op	
 	*/
+    // Step 1: first block (may be partial)
+    blkoff = offset % SFS_BLKSIZE;
+    if (blkno == end_blkno) {
+        size_t size = endpos - offset;
+        ret = sfs_bmap_load_nolock(sfs, sin, blkno, &ino);
+        if (ret) goto out;
+        ret = sfs_buf_op(sfs, buf, size, ino, blkoff);
+        if (ret) goto out;
+        alen += size;
+        goto out;
+    }
 
-    
+    // first block partial
+    if (blkoff) {
+        size_t size = SFS_BLKSIZE - blkoff;
+        ret = sfs_bmap_load_nolock(sfs, sin, blkno, &ino);
+        if (ret) goto out;
+        ret = sfs_buf_op(sfs, buf, size, ino, blkoff);
+        if (ret) goto out;
+        alen += size;
+        blkno++;
+        buf = (char *)buf + size;
+    }
 
+    // Step 2: full blocks
+    for (; blkno < end_blkno; blkno++) {
+        ret = sfs_bmap_load_nolock(sfs, sin, blkno, &ino);
+        if (ret) goto out;
+        ret = sfs_block_op(sfs, buf, ino, 1);
+        if (ret) goto out;
+        alen += SFS_BLKSIZE;
+        buf = (char *)buf + SFS_BLKSIZE;
+    }
+
+    // Step 3: last block partial
+    size_t last_size = endpos % SFS_BLKSIZE;
+    if (last_size) {
+        ret = sfs_bmap_load_nolock(sfs, sin, blkno, &ino);
+        if (ret) goto out;
+        ret = sfs_buf_op(sfs, buf, last_size, ino, 0);
+        if (ret) goto out;
+        alen += last_size;
+    }
 out:
     *alenp = alen;
     if (offset + alen > sin->din->size) {
