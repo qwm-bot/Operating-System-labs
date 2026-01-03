@@ -319,6 +319,291 @@ put_kargv(int argc, char **kargv)
 ## 扩展练习 Challenge1：完成基于“UNIX的PIPE机制”的设计方案
 >如果要在ucore里加入UNIX的管道（Pipe）机制，至少需要定义哪些数据结构和接口？（接口给出语义即可，不必具体实现。数据结构的设计应当给出一个（或多个）具体的C语言struct定义。在网络上查找相关的Linux资料和实现，请在实验报告中给出设计实现”UNIX的PIPE机制“的概要设方案，你的设计应当体现出对可能出现的同步互斥问题的处理。）
 
+
+### 1.Linux Pipe机制参考
+
+通过查阅Linux内核源码和相关资料，Linux中pipe的实现具有以下特点：
+
+1. **数据结构**: 使用`pipe_inode_info`结构体表示管道
+2. **缓冲区**: 使用`pipe_buffer`数组存储数据页，支持动态分配
+3. **同步机制**: 使用`mutex`和`wait_queue`实现进程同步
+4. **非阻塞I/O**: 支持O_NONBLOCK标志实现非阻塞读写
+5. **信号处理**: 支持SIGPIPE信号（当向已关闭读端的管道写入时）
+
+
+本设计借鉴Linux的实现思路，但针对ucore的特点进行了简化：
+- 使用固定大小的环形缓冲区（4KB），简化内存管理
+- 复用ucore现有的信号量和等待队列机制
+- 保持与UNIX标准pipe语义的兼容性
+
+### 2.核心数据结构设计
+
+#### （1）pipe结构体
+
+这是管道机制的核心数据结构，表示一个管道实例：
+
+```c
+#define PIPE_BUF_SIZE 4096  // 管道缓冲区大小（4KB，一个页面）
+
+struct pipe {
+    // 数据缓冲区（环形缓冲区）
+    char buffer[PIPE_BUF_SIZE];
+    size_t read_pos;              // 读位置指针
+    size_t write_pos;             // 写位置指针
+    size_t data_size;             // 当前缓冲区中的数据量
+    
+    // 同步互斥机制
+    semaphore_t mutex;            // 保护pipe结构的互斥信号量
+    semaphore_t read_sem;         // 读等待信号量（当缓冲区为空时阻塞）
+    semaphore_t write_sem;        // 写等待信号量（当缓冲区满时阻塞）
+    
+    // 引用计数和状态
+    int read_refs;                // 读端引用计数
+    int write_refs;               // 写端引用计数
+    bool read_closed;             // 读端是否已关闭
+    bool write_closed;            // 写端是否已关闭
+    
+    // 等待队列（用于进程阻塞）
+    wait_queue_t read_wait_queue;   // 读等待队列
+    wait_queue_t write_wait_queue;  // 写等待队列
+    
+    // 链表管理
+    list_entry_t pipe_link;       // 用于pipe管理链表的链接
+};
+```
+
+**设计说明：**
+- 使用固定大小的缓冲区，通过read_pos和write_pos实现循环使用，提高空间利用率
+- mutex保护整个结构，read_sem和write_sem分别控制读写阻塞
+- 支持多个进程共享同一个pipe端
+- 使用ucore的wait_queue机制实现进程阻塞和唤醒
+
+#### （2）pipe_manager结构体
+
+用于管理系统中的所有pipe实例：
+
+```c
+#define MAX_PIPES 1024  // 系统最大管道数
+
+struct pipe_manager {
+    struct pipe pipes[MAX_PIPES];  // 管道数组
+    int pipe_count;                 // 当前管道数量
+    semaphore_t manager_sem;        // 保护pipe_manager的互斥信号量
+    list_entry_t free_list;         // 空闲管道链表
+    list_entry_t used_list;         // 使用中管道链表
+};
+```
+
+**设计说明：**
+- 集中管理系统中所有pipe实例，便于资源分配和回收
+- 使用链表管理空闲和使用的pipe，提高分配效率
+- 通过manager_sem保护管理操作，避免竞态条件
+
+#### （3）file结构体扩展
+
+在ucore现有的`file`结构体中添加pipe相关字段：
+
+```c
+struct file {
+    enum {
+        FD_NONE, FD_INIT, FD_OPENED, FD_CLOSED,
+    } status;
+    bool readable;
+    bool writable;
+    int fd;
+    off_t pos;
+    struct inode *node;      // 对于pipe，此字段为NULL
+    int open_count;
+    
+    // Pipe相关扩展字段
+    struct pipe *pipe_ptr;   // 指向关联的pipe结构
+    bool is_pipe_read;       // 标识是否为pipe的读端
+    bool is_pipe_write;      // 标识是否为pipe的写端
+};
+```
+
+**设计说明：**
+- pipe文件描述符复用现有的file结构，保持系统一致性。但是通过pipe_ptr字段区分普通文件和pipe
+- is_pipe_read/is_pipe_write标识pipe的端类型，便于在read/write时路由
+
+### 3.系统调用接口设计
+
+#### （1）pipe()系统调用
+
+**用户空间接口：**
+```c
+int pipe(int fd[2]);
+```
+- 创建一个匿名管道，返回两个文件描述符。`fd[0]`读端文件描述符，用于从管道读取数据；`fd[1]`写端文件描述符，用于向管道写入数据。
+
+- 成功返回0，失败返回-1并设置errno为以下值之一：
+  - `EFAULT`: fd指针无效（用户空间指针无效）
+  - `EMFILE`: 进程打开文件数达到上限
+  - `ENFILE`: 系统管道数达到上限
+  - `ENOMEM`: 内存不足
+
+
+**内核处理函数：**
+```c
+int sys_pipe(uint64_t arg[]);
+```
+
+**实现流程：**
+1. 验证用户空间指针有效性（使用copy_from_user等安全函数）
+2. 调用pipe_alloc()从pipe管理器分配pipe结构
+3. 调用pipe_create()初始化pipe（初始化缓冲区、信号量、等待队列等）
+4. 分配两个file描述符（fd[0]和fd[1]）
+5. 设置file结构的pipe相关字段（pipe_ptr、is_pipe_read、is_pipe_write）
+6. 将fd数组写入用户空间
+7. 返回0表示成功
+
+#### （2）read()系统调用扩展
+
+
+当fd是pipe读端时，从管道读取数据到用户缓冲区。如果管道为空且写端未关闭，阻塞等待直到有数据写入；如果管道为空且写端已关闭，返回0（EOF，文件结束）。最后返回实际读取的字节数。
+
+
+```c
+// 在sys_read()中添加pipe检测
+if (file->is_pipe_read && file->pipe_ptr != NULL) {
+    return pipe_read(file->pipe_ptr, buf, len);
+} else {
+    // 原有的文件读取逻辑
+    return file_read(fd, buf, len, ...);
+}
+```
+
+#### （3）write()系统调用扩展
+
+当fd是pipe写端时，将用户缓冲区数据写入管道。如果管道满且读端未关闭，阻塞等待直到有空间；如果读端已关闭，返回EPIPE错误（Broken pipe）。最后返回实际写入的字节数。
+
+
+```c
+// 在sys_write()中添加pipe检测
+if (file->is_pipe_write && file->pipe_ptr != NULL) {
+    return pipe_write(file->pipe_ptr, buf, len);
+} else {
+    // 原有的文件写入逻辑
+    return file_write(fd, buf, len, ...);
+}
+```
+
+#### （4）close()系统调用扩展
+
+关闭pipe的文件描述符，减少对应端的引用计数。当引用计数为0时，设置关闭标志并唤醒等待的进程；当两端都关闭时，调用pipe_free()释放pipe资源。
+
+```c
+// 在sys_close()中添加pipe处理
+if (file->pipe_ptr != NULL) {
+    if (file->is_pipe_read) {
+        pipe_close_read(file->pipe_ptr);
+    }
+    if (file->is_pipe_write) {
+        pipe_close_write(file->pipe_ptr);
+    }
+    // 检查是否两端都关闭，如果是则释放pipe
+    if (file->pipe_ptr->read_closed && 
+        file->pipe_ptr->write_closed) {
+        pipe_free(file->pipe_ptr);
+    }
+}
+// 原有的文件关闭逻辑
+```
+
+
+### 核心操作函数接口
+
+#### pipe_create()
+```c
+int pipe_create(struct pipe **pipe_store);
+```
+创建并初始化 pipe 结构
+#### pipe_destroy()
+```c
+void pipe_destroy(struct pipe *pipe);
+```
+销毁pipe结构并释放资源
+
+
+#### pipe_read()
+```c
+int pipe_read(struct pipe *pipe, void *buf, size_t len);
+```
+当管道为空且写端仍未关闭时，读操作会阻塞等待；如果管道为空且写端已经关闭，则返回 0 表示到达文件末尾（EOF）。函数通过环形缓冲区读取数据，在成功读取后会唤醒可能因管道已满而阻塞的写进程，最终返回实际读取的字节数。
+
+#### pipe_write()
+```c
+int pipe_write(struct pipe *pipe, const void *buf, size_t len);
+```
+如果读端已经关闭，写操作会失败并返回 EPIPE 错误；当管道已满且读端仍然存在时，写操作会阻塞等待。函数同样使用环形缓冲区进行写入，并在写入完成后唤醒可能因管道为空而阻塞的读进程，返回实际写入的字节数。
+
+
+#### pipe_close_read()
+```c
+void pipe_close_read(struct pipe *pipe);
+```
+用于关闭管道的读端，函数会减少读端引用计数，当 read_refs 下降为 0 时设置 read_closed 标志，并唤醒所有正在等待写入的进程。
+
+#### pipe_close_write()
+```c
+void pipe_close_write(struct pipe *pipe);
+```
+用于关闭写端，同样会减少写端引用计数；当最后一个写端关闭后，管道被标记为写端关闭，并唤醒所有阻塞在读操作上的进程。
+
+#### pipe_manager_init()
+```c
+void pipe_manager_init(void);
+```
+初始化全局的 pipe 管理结构，包括空闲链表、使用链表以及相关的互斥保护，一般在系统启动阶段完成。
+
+#### pipe_alloc()
+```c
+struct pipe *pipe_alloc(void);
+```
+负责从管理器中取出一个可用的 pipe 结构并投入使用，分配失败时返回 NULL。
+
+#### pipe_free()
+```c
+void pipe_free(struct pipe *pipe);
+```
+在确认 pipe 已完全关闭后回收该结构，将其重新放回管理器中供后续使用。
+
+### 同步互斥机制设计
+
+#### 互斥保护机制
+
+- 在 pipe 的实现中，使用一个 mutex 信号量来保护 pipe 结构体，保证对 pipe 状态的修改不会发生并发冲突。只要访问或修改 pipe 的内部状态，就必须先获取 mutex；同时避免在持有 mutex 的情况下进行长时间阻塞，进程需要等待时通过等待队列机制释放锁后再阻塞，而不是直接在锁内 sleep。
+
+- 对于 pipe 管理器，则使用单独的 manager_sem 信号量进行保护，主要用于 pipe 的分配和回收操作。为了避免死锁，约定统一的加锁顺序：如果同时需要访问管理器和具体的 pipe，必须先获取 manager_sem，再获取 pipe 自身的 mutex。
+
+#### 条件同步机制
+
+当管道中没有数据可读时，读进程需要阻塞等待，因此使用 read_sem 作为同步手段，其初始状态表示当前没有可读数据；一旦有写进程向管道写入数据，就会唤醒相应的读进程。同样地，当管道缓冲区已满时，写进程不能继续写入，需要等待可用空间，因此使用 write_sem 进行控制，在有数据被读出后唤醒等待写入的进程。
+
+#### 等待队列机制
+
+除了信号量外，pipe 还要维护读等待队列和写等待队列，用于管理被阻塞的进程。当管道为空时，尝试读取的进程会被加入读等待队列；当管道写满时，写进程会被加入写等待队列。对应地，在数据写入或读出后，通过唤醒等待队列中的进程，使其重新参与调度并继续执行。
+
+
+
+### 总结
+
+1. 使用mutex、信号量和等待队列的多层次同步机制，充分处理了并发访问问题
+2. 环形缓冲区设计，空间利用率高，实现简单
+
+
+3. 与Linux实现的对比
+
+| 特性 | Linux实现 | ucore设计 |
+|------|-----------|-----------|
+| 缓冲区 | 动态页分配 | 固定4KB缓冲区 |
+| 同步机制 | mutex + wait_queue | mutex + semaphore + wait_queue |
+| 非阻塞I/O | 支持 | 可扩展支持 |
+| 信号处理 | 支持SIGPIPE | 可扩展支持 |
+| 原子性 | PIPE_BUF保证 | PIPE_BUF_SIZE保证 |
+
+
+
 ## 扩展练习 Challenge2：完成基于“UNIX的软连接和硬连接机制”的设计方案
 >如果要在ucore里加入UNIX的软连接和硬连接机制，至少需要定义哪些数据结构和接口？（接口给出语义即可，不必具体实现。数据结构的设计应当给出一个（或多个）具体的C语言struct定义。在网络上查找相关的Linux资料和实现，请在实验报告中给出设计实现”UNIX的软连接和硬连接机制“的概要设方案，你的设计应当体现出对可能出现的同步互斥问题的处理。）
 
@@ -330,3 +615,7 @@ put_kargv(int argc, char **kargv)
 **2. 文件数据一致性与访问控制**
 
 文件系统通过缓冲区缓存、写回策略及事务或日志机制保证文件数据与元数据的一致性，同时利用权限位、用户和组信息控制对文件的读、写和执行操作，确保在多用户环境下数据安全和隔离，同时支持操作系统的统一访问接口（如虚拟文件系统 VFS）。
+
+**3. 管道**
+
+pipe 通过内核中的缓冲区实现进程间的单向通信，读写两端通过系统调用访问。当管道为空或已满时，进程通过等待队列阻塞，并在条件满足时被唤醒。
