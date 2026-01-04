@@ -1,4 +1,3 @@
-<img width="1253" height="556" alt="image" src="https://github.com/user-attachments/assets/209e81f5-55a6-466c-bd39-66f8689b8c4b" />
 # lab6——进程调度
 
 ## 练习0：填写已有实验
