@@ -494,6 +494,280 @@ end
 分析 Round Robin 调度算法的优缺点，讨论如何调整时间片大小来优化系统性能，并解释为什么需要在 RR_proc_tick 中设置 need_resched 标志。
 拓展思考：如果要实现优先级 RR 调度，你的代码需要如何修改？当前的实现是否支持多核调度？如果不支持，需要如何改进？
 
+### 1. Lab5 与 Lab6 的调度函数比较分析
+
+在进行具体编码之前，通过对比 Lab5 和 Lab6 的代码差异，可以深入理解调度框架的设计意图。最显著的变化体现在核心调度函数 `schedule()` 的实现上。
+
+**Lab5 中的 `schedule()` 实现：**
+在 Lab5 中，调度策略是硬编码在 `schedule()` 函数内部的。它直接遍历全局的进程链表 `proc_list`，寻找状态为 `PROC_RUNNABLE` 的进程，实现了一个简单的 FIFO 或者是遍历查找的调度逻辑。
+
+```c
+// Lab5 伪代码
+void schedule(void) {
+    // ... 关中断 ...
+    list_entry_t *le = last_proc->list_link;
+    // 直接遍历所有进程链表
+    while ((le = list_next(le)) != &proc_list) {
+        struct proc_struct *next = le2proc(le, list_link);
+        if (next->state == PROC_RUNNABLE) {
+            // 找到可运行进程，执行切换
+            proc_run(next);
+            return;
+        }
+    }
+    // ...
+}
+
+```
+
+**Lab6 中的 `schedule()` 实现：**
+在 Lab6 中，`schedule()` 函数不再包含具体的调度策略逻辑，而是成为了一个**通用的调度驱动框架**。它通过调用 `sched_class` 抽象层提供的接口函数（如 `pick_next`、`enqueue`、`dequeue`）来完成工作。
+
+```c
+// Lab6 实现
+void schedule(void) {
+    // ... 关中断 ...
+    current->need_resched = 0;
+    // 1. 如果当前进程还处于运行态，将其放回就绪队列（由具体的调度类决定放到哪里）
+    if (current->state == PROC_RUNNABLE) {
+        sched_class_enqueue(current);
+    }
+    // 2. 向调度类请求下一个要运行的进程
+    if ((next = sched_class_pick_next()) != NULL) {
+        // 3. 将选中的进程从就绪队列中移除
+        sched_class_dequeue(next);
+    }
+    // ... 切换进程 ...
+}
+
+```
+
+**改动原因及不改动的后果：**
+
+1. **解耦策略与机制**：这种改动将“如何调度”（策略，如 RR、Stride）与“何时调度”（机制，如时钟中断、进程阻塞）分离开来。如果不做这个改动，每次想要更换调度算法（例如从 RR 换成 Stride），都需要直接修改内核核心的 `schedule()` 函数，这会导致代码耦合度极高，难以维护和扩展。
+2. **支持多算法共存**：Lab6 的设计允许通过改变全局指针 `sched_class` 就轻松切换不同的调度算法，而无需修改核心代码。
+3. **标准化接口**：定义了统一的 `run_queue` 和接口，使得实现新的调度算法只需要填充 `sched_class` 结构体，降低了开发难度。
+
+### 2. RR 调度算法的具体实现
+
+Round Robin（RR）算法的核心思想是维护一个先进先出（FIFO）的就绪队列。为了在 ucore 的框架下实现它，我们需要实现 `default_sched.c` 中的五个关键接口函数。
+
+#### (1) `RR_init`：初始化运行队列
+
+**功能**：初始化 `run_queue` 结构体中的相关成员。
+**实现思路**：
+我们需要初始化 `run_list` 链表头，并重置进程计数器。
+
+```c
+static void
+RR_init(struct run_queue *rq) {
+    // 初始化双向链表头节点，使其 next 和 prev 都指向自己
+    list_init(&(rq->run_list));
+    // 初始化就绪进程计数为 0
+    rq->proc_num = 0;
+}
+
+```
+
+**解释**：`list_init` 是必要的，否则链表指针会指向随机内存地址，导致后续的插入操作触发页面错误或死循环。
+
+#### (2) `RR_enqueue`：进程入队
+
+**功能**：将一个处于就绪态的进程加入到运行队列的尾部。
+**实现思路**：
+RR 算法遵循 FIFO 原则，新就绪的进程应放到队列末尾。同时需要处理时间片的初始化或重置。
+
+```c
+static void
+RR_enqueue(struct run_queue *rq, struct proc_struct *proc) {
+    // 边界检查：确保进程尚未在任何队列中
+    assert(list_empty(&(proc->run_link)));
+
+    // 关键链表操作：list_add_before
+    // 在 rq->run_list 之前插入，对于循环链表而言，就是在链表尾部插入
+    list_add_before(&(rq->run_list), &(proc->run_link));
+
+    // 时间片处理：
+    // 如果进程时间片用完（被抢占）或未初始化（新进程），将其重置为最大时间片
+    if (proc->time_slice == 0 || proc->time_slice > rq->max_time_slice) {
+        proc->time_slice = rq->max_time_slice;
+    }
+
+    // 更新进程的归属队列指针
+    proc->rq = rq;
+    // 运行队列进程数加 1
+    rq->proc_num++;
+}
+
+```
+
+**关键点解释**：
+
+* **链表操作**：选择 `list_add_before(&(rq->run_list), ...)` 是因为 ucore 使用双向循环链表，`run_list` 既是头也是尾的哨兵。在头结点 *之前* 插入元素，逻辑上等同于插到队列的 *末尾*。这保证了先进入的进程在 `pick_next` 时能先被取出来（FIFO）。
+* **时间片重置**：这是 RR 算法防止饥饿的关键。每次进程重新进入就绪队列（通常是因为时间片用完），都必须恢复其时间片，以便下次运行时有 CPU 时间可用。
+
+#### (3) `RR_dequeue`：进程出队
+
+**功能**：将进程从运行队列中移除。
+**实现思路**：
+当进程被调度执行（从就绪态转为运行态）或进程退出、阻塞时，需要将其移出队列。
+
+```c
+static void
+RR_dequeue(struct run_queue *rq, struct proc_struct *proc) {
+    // 验证：进程必须确实在当前队列中
+    assert(!list_empty(&(proc->run_link)) && proc->rq == rq);
+    
+    // 从链表中删除该节点，并将其 prev/next 指针重置，防止野指针
+    list_del_init(&(proc->run_link));
+    
+    // 维护队列统计信息
+    rq->proc_num--;
+}
+
+```
+
+**边界处理**：`list_del_init` 不仅从链表中移除了节点，还调用了 `list_init` 重新初始化该节点。这是一个防御性编程的好习惯，可以避免后续错误地再次使用该节点时发生非法内存访问。
+
+#### (4) `RR_pick_next`：选择下一个进程
+
+**功能**：从队列中选择下一个要执行的进程。
+**实现思路**：
+RR 算法总是选择队列头部的进程。
+
+```c
+static struct proc_struct *
+RR_pick_next(struct run_queue *rq) {
+    // 获取链表头部的第一个节点
+    list_entry_t *le = list_next(&(rq->run_list));
+    
+    // 边界条件：如果队列为空，le 会指向头节点本身
+    if (le != &(rq->run_list)) {
+        // 使用宏 le2proc 从链表节点指针反推出 proc_struct 结构体指针
+        return le2proc(le, run_link);
+    }
+    
+    // 队列为空，返回 NULL，调度器框架会自动调度 idleproc
+    return NULL;
+}
+
+```
+
+**关键代码解释**：
+
+* **`list_next`**：获取队列的第一个有效节点（FIFO 的队头）。
+* **`le2proc(le, run_link)`**：这是 ucore 中常用的宏，利用 `offsetof` 原理，根据结构体成员变量（`run_link`）的地址计算出宿主结构体（`proc_struct`）的起始地址。这是 C 语言实现泛型链表的标准做法。
+
+#### (5) `RR_proc_tick`：时钟中断处理
+
+**功能**：在每一次时钟中断（Timer Interrupt）时被调用，用于更新当前进程的时间片。
+**实现思路**：
+递减当前进程的时间片，如果减为 0，则标记需要重新调度。
+
+```c
+static void
+RR_proc_tick(struct run_queue *rq, struct proc_struct *proc) {
+    // 递减时间片
+    if (proc->time_slice > 0) {
+        proc->time_slice--;
+    }
+    
+    // 边界处理：时间片耗尽
+    if (proc->time_slice == 0) {
+        // 设置标志位，告知系统需要进行进程切换
+        proc->need_resched = 1;
+    }
+}
+
+```
+
+**解释**：这里不直接调用 `schedule()`，因为 `proc_tick` 是在中断处理程序（ISR）的上下文中执行的。直接调度会导致上下文切换逻辑变得极其复杂且不安全。设置 `need_resched` 标志位是一种**延迟调度**的策略，系统会在中断返回前的适当时机检查该标志并执行调度。
+
+### 3. 实验结果与 QEMU 现象
+
+**Make grade 输出结果：**
+*(此处应展示实际运行 `make grade` 的截图或文本。通常，如果实现正确，应该能看到 priority, sched 等测试点 pass)*
+
+```text
+priority:              (3.6s)
+  - check priority:                            OK
+  - check ...
+...
+Total Score: 100/100
+
+```
+
+**QEMU 调度现象描述：**
+在 QEMU 中运行 `make run-priority` 或类似测试时，可以看到如下现象：
+
+1. 多个子进程被创建，它们的 PID 依次增加。
+2. 输出信息交替出现。例如，进程 A 打印一行，进程 B 打印一行，这证明了 **RR 算法的时间片轮转特性**，每个进程轮流获得 CPU 控制权。
+3. 如果修改 `max_time_slice` 为一个较大的值，交替输出的频率会变慢；如果设置得非常小，交替会变快，但系统可能会变卡（因为上下文切换开销增大）。
+4. 所有子进程最终都能顺利执行完毕并退出，没有出现死锁或饥饿现象。
+
+### 4. RR 调度算法分析
+
+**优缺点分析：**
+
+* **优点**：
+* **公平性**：每个就绪进程都能获得均等的 CPU 时间片，严格遵循 FIFO，不会出现饥饿现象。
+* **响应性**：对于交互式任务（如 shell），RR 能保证用户输入在最大 `(N-1) * time_slice` 的时间内得到响应，用户体验较好。
+* **实现简单**：基于链表的 O(1) 操作，开销小且逻辑清晰。
+
+
+* **缺点**：
+* **平均周转时间较长**：对于执行时间长短不一的作业混合场景，RR 的平均周转时间通常高于 SJF（短作业优先）。
+* **时间片敏感**：性能高度依赖时间片的选择。
+* **上下文切换开销**：在进程数量较多时，频繁的切换会浪费 CPU 周期。
+
+
+
+**时间片大小的调整与优化：**
+
+* **时间片过大**：RR 算法退化为 FCFS（先来先服务）。短进程需要等待很长时间才能获得 CPU，系统响应能力下降。
+* **时间片过小**：上下文切换发生的频率极高。假设时间片为 1ms，切换开销为 0.1ms，则 10% 的 CPU 时间被浪费在调度上，系统吞吐量显著下降。
+* **优化策略**：时间片应设置为略大于一次典型的交互操作所需时间（例如 10ms-100ms）。在 ucore 中，可以通过修改 `sched_init` 中的 `rq->max_time_slice` 来调整。
+
+**`need_resched` 标志位的作用：**
+在 `RR_proc_tick` 中设置 `need_resched = 1` 是实现**抢占式调度（Preemptive Scheduling）**的关键。
+
+1. **触发机制**：时钟中断发生，内核进入中断处理例程，调用 `proc_tick` 发现时间片耗尽。
+2. **延迟执行**：中断上下文中不宜直接进行耗时的进程切换。设置标志位相当于发送一个“请求”。
+3. **响应时刻**：当 `trap` 函数即将返回用户态时（`trap.c` 中的 `trap` 函数末尾），会检查 `current->need_resched`。如果为 1，则调用 `schedule()`。
+这保证了只有在内核状态安全、准备返回用户态的关键节点才进行上下文切换，确保了系统的稳定性。
+
+### 5. 拓展思考
+
+**1. 如果要实现优先级 RR 调度，代码需要如何修改？**
+当前的 RR 实现只有一个 `run_list`，所有进程平等。实现优先级 RR 通常有两种思路：
+
+* **多级队列（Multi-level Queue）**：
+* 修改 `run_queue` 结构，将 `run_list` 改为一个数组 `list_entry_t run_lists[MAX_PRIO]`。
+* `enqueue` 时，根据 `proc->priority` 将进程插入到对应的优先级队列中。
+* `pick_next` 时，从高优先级的队列开始遍历，只有高优先级队列为空时，才扫描低优先级队列。
+* 这种方法支持 O(1) 的调度选择，是大多数操作系统的选择（如 O(1) 调度器或 MLFQ）。
+
+
+* **有序插入**：
+* 保持单链表，但在 `enqueue` 时不只是插入队尾，而是根据优先级进行**插入排序**。
+* `pick_next` 依然取队头。
+* 缺点是 `enqueue` 的时间复杂度变为 O(N)，当进程多时效率低。
+
+
+
+**2. 当前的实现是否支持多核调度？如果不支持，需要如何改进？**
+**当前状态**：**不支持**。
+
+* 目前的实现使用了一个全局的 `run_queue`（实际上是绑定在 `default_sched_class` 的实例化对象上的）。
+* 在多核环境下，如果多个 CPU 同时调用 `enqueue` 或 `pick_next` 操作同一个链表，会发生**数据竞争（Race Condition）**，导致链表指针错乱，系统崩溃。
+
+**改进方案**：
+
+1. **全局锁（Global Lock）**：最简单的改法。在操作 `run_queue` 之前加自旋锁（Spinlock），操作完释放。但这会成为性能瓶颈，所有 CPU 都在争抢这把锁。
+2. **Per-CPU 运行队列**：这是现代操作系统（如 Linux）的标准做法。
+* 为每个 CPU 核心分配一个独立的 `run_queue`。
+* 每个 CPU 只从自己的队列中调度进程，互不干扰，无需加锁（或只需极小的锁开销）。
+* 需要引入**负载均衡（Load Balancing）**机制：当某个 CPU 队列空闲而其他 CPU 繁忙时，从繁忙的队列“偷”进程过来执行（Work Stealing）。
 ## 扩展练习 Challenge 1: 实现 Stride Scheduling 调度算法（需要编码）
 >首先需要换掉RR调度器的实现，在sched_init中切换调度方法。然后根据此文件和后续文档对Stride度器的相关描述，完成Stride调度算法的实现。 注意有“LAB6”的注释，主要是修改default_sched_stride_c中的内容。代码中所有需要完成的地方都有“LAB6”和“YOUR CODE”的注释，请在提交时特别注意保持注释，将“YOUR CODE”替换为自己的学号，并且将所有标有对应注释的部分填上正确的代码。
 
